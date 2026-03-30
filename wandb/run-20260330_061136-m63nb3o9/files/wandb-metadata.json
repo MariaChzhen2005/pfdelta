@@ -1,0 +1,44 @@
+{
+  "os": "Linux-6.8.0-106-generic-x86_64-with-glibc2.39",
+  "python": "CPython 3.12.13",
+  "startedAt": "2026-03-30T06:11:36.333198Z",
+  "args": [
+    "--stage",
+    "both"
+  ],
+  "program": "/workspace/pfdelta/models.py",
+  "codePath": "models.py",
+  "codePathLocal": "models.py",
+  "git": {
+    "remote": "https://github.com/MariaChzhen2005/pfdelta.git",
+    "commit": "d00710a3b3e5e28aacdd16ad9ce7eae9324e2aff"
+  },
+  "email": "mzcan2017china@gmail.com",
+  "root": "/workspace/pfdelta",
+  "host": "ae65f7b2c41f",
+  "executable": "/venv/main/bin/python",
+  "cpu_count": 16,
+  "cpu_count_logical": 32,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "34359738368",
+      "used": "17878331392"
+    }
+  },
+  "memory": {
+    "total": "67266666496"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-d5ab3fa2-0c5f-a11a-50b3-512e1e120e6d"
+    }
+  ],
+  "cudaVersion": "12.7",
+  "writerId": "prmwc9xpa87yak71xaj391oigvi5pzuq"
+}

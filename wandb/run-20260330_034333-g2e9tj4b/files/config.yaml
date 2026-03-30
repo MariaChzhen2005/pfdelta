@@ -1,0 +1,115 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            aqsdaluc7yhhaxal10jg7ninwyp36bqu:
+                args:
+                    - --stage
+                    - "2"
+                    - --resume-from
+                    - checkpoints/stage1_final.pt
+                codePath: models.py
+                codePathLocal: models.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                cudaVersion: "12.7"
+                disk:
+                    /:
+                        total: "34359738368"
+                        used: "17872060416"
+                email: mzcan2017china@gmail.com
+                executable: /venv/main/bin/python
+                git:
+                    commit: f443419ea9ba759ebd4198eac9b541fe2854618a
+                    remote: https://github.com/MariaChzhen2005/pfdelta.git
+                gpu: NVIDIA GeForce RTX 4090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-d5ab3fa2-0c5f-a11a-50b3-512e1e120e6d
+                host: ae65f7b2c41f
+                memory:
+                    total: "67266666496"
+                os: Linux-6.8.0-106-generic-x86_64-with-glibc2.39
+                program: /workspace/pfdelta/models.py
+                python: CPython 3.12.13
+                root: /workspace/pfdelta
+                startedAt: "2026-03-30T03:43:33.792896Z"
+                writerId: aqsdaluc7yhhaxal10jg7ninwyp36bqu
+        m: []
+        python_version: 3.12.13
+        t:
+            "1":
+                - 1
+                - 77
+            "2":
+                - 1
+                - 77
+            "3":
+                - 1
+                - 16
+            "4": 3.12.13
+            "5": 0.25.1
+            "10":
+                - 20
+            "12": 0.25.1
+            "13": linux-x86_64
+T:
+    value: 5
+batch_size:
+    value: 32
+checkpoint_dir:
+    value: checkpoints
+data_dir:
+    value: data/processed/task4_solvability
+dropout:
+    value: 0.1
+epochs_stage1:
+    value: 50
+epochs_stage2:
+    value: 100
+epsilon:
+    value: 1e-07
+grad_clip:
+    value: 1
+hidden_dim:
+    value: 128
+lambda_1:
+    value: 1
+lambda_2:
+    value: 1
+lambda_3:
+    value: 0.001
+log_dir:
+    value: logs
+lr:
+    value: 0.001
+lsqr_damp:
+    value: 0
+max_iter_inference:
+    value: 20
+num_mp_layers:
+    value: 4
+rank_k:
+    value: 8
+scheduler_factor:
+    value: 0.5
+scheduler_patience:
+    value: 10
+seed:
+    value: 42
+stagnation_tol:
+    value: 1e-06
+tau:
+    value: 50
+use_amp:
+    value: false
+use_implicit_diff:
+    value: false
+wandb_project:
+    value: pfdelta-bifurcation
+weight_decay:
+    value: 1e-05

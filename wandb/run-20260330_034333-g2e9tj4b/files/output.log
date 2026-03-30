@@ -1,0 +1,32 @@
+03:43:34  INFO      ============================================================
+03:43:34  INFO      STAGE 2  —  100 epochs  (solver ON)
+03:43:34  INFO      ============================================================
+Stage 2:   0%|                                                                             | 0/100 [00:00<?, ?epoch/s]/workspace/pfdelta/models.py:1202: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=self.amp_enabled):                                 | 0/4470 [00:00<?, ?batch/s]
+Stage 2:   0%|                                                                           | 0/100 [1:28:45<?, ?epoch/s]
+Traceback (most recent call last):                                                                                    
+  File "/workspace/pfdelta/models.py", line 1584, in <module>
+    main()
+  File "/workspace/pfdelta/models.py", line 1573, in main
+    trainer.train(stages=args.stage)
+  File "/workspace/pfdelta/models.py", line 1302, in train
+    self._run_stage(stage=2, num_epochs=self.cfg.epochs_stage2,
+  File "/workspace/pfdelta/models.py", line 1203, in _run_stage
+    outputs = self.model(data, run_solver=(stage == 2))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 960, in forward
+    x_final_list, all_residuals = self.solver.forward_batch(
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 816, in forward_batch
+    J_val = PowerFlowPhysics.compute_jacobian(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 400, in compute_jacobian
+    z = torch.zeros(n * n, device=device, dtype=dtype)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

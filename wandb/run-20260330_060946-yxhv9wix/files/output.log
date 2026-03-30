@@ -1,0 +1,33 @@
+06:09:47  INFO      ============================================================
+06:09:47  INFO      STAGE 2 — 100 epochs  (solver ON)
+06:09:47  INFO      ============================================================
+  0%|                                                                                         | 0/100 [00:26<?, ?it/s]
+Traceback (most recent call last):
+  File "/workspace/pfdelta/models.py", line 1535, in <module>
+    main()
+  File "/workspace/pfdelta/models.py", line 1524, in main
+    trainer.train(stages=args.stage)
+  File "/workspace/pfdelta/models.py", line 1249, in train
+    self._run_stage(2, self.cfg.epochs_stage2, offset)
+  File "/workspace/pfdelta/models.py", line 1171, in _run_stage
+    outputs = self.model(data, run_solver=(stage == 2))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 957, in forward
+    x_final_list, all_residuals = self.solver.forward_batch_regularised(
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 710, in forward_batch_regularised
+    J_val = PowerFlowPhysics.compute_jacobian(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 355, in compute_jacobian
+    dFP_dva = _scatter_to_block(
+              ^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 161, in _scatter_to_block
+    return buf.scatter_add(0, flat, vals).view(n, n)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

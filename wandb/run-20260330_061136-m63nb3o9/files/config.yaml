@@ -1,0 +1,136 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            prmwc9xpa87yak71xaj391oigvi5pzuq:
+                args:
+                    - --stage
+                    - both
+                codePath: models.py
+                codePathLocal: models.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                cudaVersion: "12.7"
+                disk:
+                    /:
+                        total: "34359738368"
+                        used: "17878331392"
+                email: mzcan2017china@gmail.com
+                executable: /venv/main/bin/python
+                git:
+                    commit: d00710a3b3e5e28aacdd16ad9ce7eae9324e2aff
+                    remote: https://github.com/MariaChzhen2005/pfdelta.git
+                gpu: NVIDIA GeForce RTX 4090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-d5ab3fa2-0c5f-a11a-50b3-512e1e120e6d
+                host: ae65f7b2c41f
+                memory:
+                    total: "67266666496"
+                os: Linux-6.8.0-106-generic-x86_64-with-glibc2.39
+                program: /workspace/pfdelta/models.py
+                python: CPython 3.12.13
+                root: /workspace/pfdelta
+                startedAt: "2026-03-30T06:11:36.333198Z"
+                writerId: prmwc9xpa87yak71xaj391oigvi5pzuq
+        m: []
+        python_version: 3.12.13
+        t:
+            "1":
+                - 1
+                - 77
+            "2":
+                - 1
+                - 77
+            "3":
+                - 1
+                - 16
+                - 61
+            "4": 3.12.13
+            "5": 0.25.1
+            "10":
+                - 20
+            "12": 0.25.1
+            "13": linux-x86_64
+T:
+    value: 5
+batch_size:
+    value: 32
+bidirectional_edges:
+    value: true
+checkpoint_dir:
+    value: checkpoints
+data_dir:
+    value: data/processed/task4_solvability
+dropout:
+    value: 0.1
+early_stop_patience:
+    value: 25
+epochs_stage1:
+    value: 50
+epochs_stage2:
+    value: 100
+epsilon:
+    value: 1e-07
+grad_clip:
+    value: 1
+hidden_dim:
+    value: 128
+lambda_1:
+    value: 1
+lambda_2:
+    value: 1
+lambda_3:
+    value: 0.001
+lambda_infeasibility:
+    value: 1
+log_dir:
+    value: logs
+lr:
+    value: 0.001
+max_iter_inference:
+    value: 20
+mu_decrease:
+    value: 0.5
+mu_increase:
+    value: 2
+mu_init:
+    value: 0.001
+mu_max:
+    value: 1e+06
+mu_min:
+    value: 1e-08
+num_attention_heads:
+    value: 4
+num_mp_layers:
+    value: 4
+rank_k:
+    value: 8
+scheduler_factor:
+    value: 0.5
+scheduler_patience:
+    value: 10
+seed:
+    value: 42
+stagnation_tol:
+    value: 1e-06
+tau:
+    value: 50
+use_adaptive_lm:
+    value: false
+use_amp:
+    value: false
+use_global_attention:
+    value: true
+vm_max:
+    value: 1.5
+vm_min:
+    value: 0.5
+wandb_project:
+    value: pfdelta-bifurcation
+weight_decay:
+    value: 1e-05
