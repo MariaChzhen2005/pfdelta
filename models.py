@@ -424,9 +424,7 @@ def _verify_jacobian(x, edge_index, ear, gs, bs, bt, vm_sp, eps=1e-5):
     return J_fd
 
 
-# ============================================================================
 # NEURAL NETWORK COMPONENTS
-# ============================================================================
 class GraphTransformerLayer(nn.Module):
     """Global self-attention over nodes within each graph.
 
@@ -613,9 +611,7 @@ class InfeasibilityHead(nn.Module):
         return self.classifier(h_graph).squeeze(-1)
 
 
-# ============================================================================
 # SOLVER HELPERS
-# ============================================================================
 def _solve_regularised_step(
     J: torch.Tensor,
     F_val: torch.Tensor,
@@ -653,9 +649,7 @@ def _project_voltage(x: torch.Tensor, vm_min: float, vm_max: float) -> torch.Ten
     return torch.cat([va, vm])
 
 
-# ============================================================================
 # UNROLLED SOLVER (BPTT only)
-# ============================================================================
 class UnrolledSolver(nn.Module):
     """Differentiable Newton-Raphson with back-propagation through time."""
 
@@ -742,9 +736,7 @@ class UnrolledSolver(nn.Module):
 
         return x_final_out, residuals_out  # type: ignore[return-value]
 
-    # ------------------------------------------------------------------ #
-    #  Adaptive LM — batched, mu detached                                 #
-    # ------------------------------------------------------------------ #
+    #  Adaptive LM — batched, mu detached                                 
     def forward_batch_adaptive_lm(
         self,
         x_pred_list: List[torch.Tensor],
@@ -840,9 +832,7 @@ class UnrolledSolver(nn.Module):
         return x_final_out, residuals_out, mu_out  # type: ignore[return-value]
 
 
-# ============================================================================
 # MAIN MODEL
-# ============================================================================
 class BifurcationAwarePFSolver(nn.Module):
     def __init__(self, cfg: Config, norm_stats: Dict[str, torch.Tensor]):
         super().__init__()
@@ -983,9 +973,7 @@ class BifurcationAwarePFSolver(nn.Module):
         }
 
 
-# ============================================================================
 # LOSS FUNCTIONS
-# ============================================================================
 def loss_state(
     x_pred: torch.Tensor,
     y_state: torch.Tensor,
@@ -1167,7 +1155,7 @@ class Trainer:
         self.best_model_state = None
         self.es_counter = 0
 
-        for epoch_local in range(num_epochs):
+        for epoch_local in tqdm(range(num_epochs)):
             epoch_global = epoch_offset + epoch_local
             self.model.train()
             epoch_loss = 0.0
