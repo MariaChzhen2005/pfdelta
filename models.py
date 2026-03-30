@@ -90,7 +90,7 @@ class Config:
     weight_decay: float = 1e-5
     batch_size: int = 32
     epochs_stage1: int = 200
-    epochs_stage2: int = 100
+    epochs_stage2: int = 30
     lambda_1: float = 1.0
     lambda_2: float = 1.0
     lambda_3: float = 1e-3
@@ -1928,8 +1928,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--lr", type=float, default=1e-3)
     g.add_argument("--weight-decay", type=float, default=1e-5)
     g.add_argument("--batch-size", type=int, default=32)
-    g.add_argument("--epochs-stage1", type=int, default=50)
-    g.add_argument("--epochs-stage2", type=int, default=100)
+    g.add_argument("--epochs-stage1", type=int, default=200)
+    g.add_argument("--epochs-stage2", type=int, default=30)
     g.add_argument("--lambda-1", type=float, default=1.0)
     g.add_argument("--lambda-2", type=float, default=1.0)
     g.add_argument("--lambda-3", type=float, default=1e-3)
