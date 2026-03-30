@@ -932,7 +932,7 @@ class UnrolledSolver(nn.Module):
 
             last_F_max: Optional[float] = None
             for _t in range(self.T):
-                with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
+                with torch.autocast(device_type="cuda", enabled=False), torch.autocast(device_type="cpu", enabled=False):
                     x_f32 = x.float()
                     F_batch, J_batch = BatchedPhysics.mismatch_and_jacobian(
                         x_f32, prep_f32, n_nodes
@@ -1007,7 +1007,7 @@ class UnrolledSolver(nn.Module):
             last_F_batch: Optional[torch.Tensor] = None
 
             for _t in range(self.T):
-                with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
+                with torch.autocast(device_type="cuda", enabled=False), torch.autocast(device_type="cpu", enabled=False):
                     x_f32 = x.float()
                     F_batch, J_batch = BatchedPhysics.mismatch_and_jacobian(
                         x_f32, prep_f32, n_nodes
@@ -1366,7 +1366,7 @@ class Trainer:
             patience=cfg.scheduler_patience,
         )
         self.amp_enabled = cfg.use_amp and device.type == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
 
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
         setup_file_logging(cfg.log_dir, prefix=f"run_{self.run_sig}")
@@ -1458,9 +1458,7 @@ class Trainer:
                 data = data.to(self.device)
                 self.optimizer.zero_grad()
 
-                with torch.amp.autocast(
-                    "cuda", enabled=self.amp_enabled
-                ):
+                with torch.autocast(device_type="cuda", enabled=False), torch.autocast(device_type="cpu", enabled=False):
                     outputs = self.model(
                         data, run_solver=(stage == 2)
                     )
