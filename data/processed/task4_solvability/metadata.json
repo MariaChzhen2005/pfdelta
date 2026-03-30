@@ -1,0 +1,47 @@
+{
+  "total_samples": 238400,
+  "feasible": 119200,
+  "infeasible": 119200,
+  "splits": {
+    "train": 143040,
+    "val": 47680,
+    "test": 47680
+  },
+  "node_features": [
+    "pd",
+    "qd",
+    "pg",
+    "vm",
+    "gs",
+    "bs",
+    "bus_type"
+  ],
+  "edge_features": [
+    "br_r",
+    "br_x",
+    "g_fr",
+    "b_fr",
+    "g_to",
+    "b_to",
+    "tap",
+    "shift"
+  ],
+  "infeasible_label": 15.0,
+  "nr_max_iter": 50,
+  "nr_tol": 1e-08,
+  "split_ratios": [
+    0.6,
+    0.2,
+    0.2
+  ],
+  "seed": 42,
+  "cases": [
+    "case14",
+    "case30"
+  ],
+  "grid_types": [
+    "n",
+    "n-1",
+    "n-2"
+  ]
+}
