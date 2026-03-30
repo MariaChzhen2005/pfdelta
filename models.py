@@ -1,32 +1,24 @@
-"""
-Implementation of:
-  1. Shared GNN encoder (GINEConv message-passing)
-  2. State predictor head  (voltage magnitudes & angles)
-  3. Bifurcation-aware regularizer head  (Λ = D + U S Uᵀ)
-  4. Differentiable unrolled Newton-Raphson optimisation layer
-  5. Two-stage curriculum training with wandb tracking
-  6. Inference pipeline with infeasibility detection
-
-Designed to consume the PyG Data objects produced by data_generation.py.
-"""
-
 import os
 import time
 import logging
 import argparse
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F_func
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GINEConv, global_mean_pool
+from torch_geometric.nn import GINEConv, global_mean_pool, global_add_pool
 from torch_geometric.data import Data, Batch
 from tqdm import tqdm
 
-import wandb
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,38 +29,41 @@ log = logging.getLogger(__name__)
 
 
 def setup_file_logging(log_dir: str) -> str:
-    """Attach a file handler to the root logger, writing to ``log_dir/run.log``.
-
-    Returns the path to the log file.
-    """
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "run.log")
     fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%H:%M:%S",
-    ))
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
+    )
     logging.getLogger().addHandler(fh)
-    log.info("Console output also saved → %s", log_path)
+    log.info("Log file → %s", log_path)
     return log_path
 
+
+# CONFIG
 @dataclass
 class Config:
-    # GNN encoder
+    # Encoder
     hidden_dim: int = 128
     num_mp_layers: int = 4
     dropout: float = 0.1
+    use_global_attention: bool = True
+    num_attention_heads: int = 4
 
     # Regulariser head
     rank_k: int = 8
 
-    # Unrolled solver
+    # Solver
     T: int = 5
     epsilon: float = 1e-7
     max_iter_inference: int = 20
-    use_implicit_diff: bool = False
-    lsqr_damp: float = 0.0
+    use_adaptive_lm: bool = False
+    mu_init: float = 1e-3
+    mu_min: float = 1e-8
+    mu_max: float = 1e6
+    mu_decrease: float = 0.5
+    mu_increase: float = 2.0
 
     # Training
     lr: float = 1e-3
@@ -79,61 +74,53 @@ class Config:
     lambda_1: float = 1.0
     lambda_2: float = 1.0
     lambda_3: float = 1e-3
+    lambda_infeasibility: float = 1.0
     grad_clip: float = 1.0
 
-    # LR scheduler
+    # Scheduler
     scheduler_patience: int = 10
     scheduler_factor: float = 0.5
+
+    # Early stopping
+    early_stop_patience: int = 25
 
     # Mixed precision
     use_amp: bool = False
 
-    # Infeasibility detection
+    # Infeasibility detection thresholds
     tau: float = 50.0
     stagnation_tol: float = 1e-6
+
+    # Voltage projection
+    vm_min: float = 0.5
+    vm_max: float = 1.5
+
+    # Data convention: True iff edge_index stores 2 directed edges per branch
+    bidirectional_edges: bool = True
 
     # Paths
     data_dir: str = "data/processed/task4_solvability"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
     wandb_project: str = "pfdelta-bifurcation"
-
-    # Reproducibility
     seed: int = 42
 
 
+# DATA HELPERS
 def load_datasets(cfg: Config):
-    """Load train/val/test .pt lists and normalisation statistics."""
-    train_data = torch.load(
-        os.path.join(cfg.data_dir, "train.pt"), weights_only=False
-    )
-    val_data = torch.load(
-        os.path.join(cfg.data_dir, "val.pt"), weights_only=False
-    )
-    test_data = torch.load(
-        os.path.join(cfg.data_dir, "test.pt"), weights_only=False
-    )
-    norm_stats = torch.load(
-        os.path.join(cfg.data_dir, "norm_stats.pt"), weights_only=False
-    )
-
+    train_data = torch.load(os.path.join(cfg.data_dir, "train.pt"), weights_only=False)
+    val_data = torch.load(os.path.join(cfg.data_dir, "val.pt"), weights_only=False)
+    test_data = torch.load(os.path.join(cfg.data_dir, "test.pt"), weights_only=False)
+    norm_stats = torch.load(os.path.join(cfg.data_dir, "norm_stats.pt"), weights_only=False)
     train_loader = DataLoader(train_data, batch_size=cfg.batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=cfg.batch_size, shuffle=False)
     test_loader = DataLoader(test_data, batch_size=cfg.batch_size, shuffle=False)
-
     return train_loader, val_loader, test_loader, norm_stats
 
 
 def denormalize_node_features(
-    x_norm: torch.Tensor,
-    x_mean: torch.Tensor,
-    x_std: torch.Tensor,
+    x_norm: torch.Tensor, x_mean: torch.Tensor, x_std: torch.Tensor
 ) -> Dict[str, torch.Tensor]:
-    """Recover raw physical node quantities from normalised tensor.
-
-    x_norm : [N, 7]  normalised (pd, qd, pg, vm, gs, bs, bus_type)
-    Returns dict with raw tensors on the same device.
-    """
     x_raw = x_norm * x_std.to(x_norm.device) + x_mean.to(x_norm.device)
     return {
         "pd": x_raw[:, 0],
@@ -147,14 +134,8 @@ def denormalize_node_features(
 
 
 def denormalize_edge_features(
-    ea_norm: torch.Tensor,
-    ea_mean: torch.Tensor,
-    ea_std: torch.Tensor,
+    ea_norm: torch.Tensor, ea_mean: torch.Tensor, ea_std: torch.Tensor
 ) -> Dict[str, torch.Tensor]:
-    """Recover raw branch parameters from normalised edge_attr.
-
-    ea_norm : [2E, 8]  normalised (r, x, g_fr, b_fr, g_to, b_to, tap, shift)
-    """
     ea_raw = ea_norm * ea_std.to(ea_norm.device) + ea_mean.to(ea_norm.device)
     return {
         "br_r": ea_raw[:, 0],
@@ -167,12 +148,30 @@ def denormalize_edge_features(
         "shift": ea_raw[:, 7],
     }
 
+# PHYSICS: POWER-FLOW MISMATCH & JACOBIAN
+def _scatter_to_block(
+    row_idx: torch.Tensor,
+    col_idx: torch.Tensor,
+    vals: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """Build a dense [n, n] matrix from COO entries via scatter-add."""
+    flat = row_idx * n + col_idx
+    buf = torch.zeros(n * n, device=vals.device, dtype=vals.dtype)
+    return buf.scatter_add(0, flat, vals).view(n, n)
+
 
 class PowerFlowPhysics:
-    """Differentiable per-graph power-flow mismatch and Jacobian.
+    """Differentiable pi-model power-flow equations.
 
-    All methods are static and operate on single-graph tensors so that the
-    unrolled solver can call them inside a per-graph loop.
+    All methods are static and operate on single-graph tensors.
+
+    IMPORTANT — edge convention
+    ---------------------------
+    Each physical branch must appear **once** in `edge_index`.  When the
+    dataset stores bidirectional edges (2 directed per branch), filter to
+    forward-only *before* calling these methods.  Both the from-side and
+    to-side injections are computed for every directed edge that is passed in.
     """
 
     @staticmethod
@@ -184,67 +183,51 @@ class PowerFlowPhysics:
         gs: torch.Tensor,
         bs: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute bus-level P and Q injections from the current state.
-
-        Uses the standard pi-model branch flow formulation (same physics as
-        pf_losses_utils.py).  All ops are pure-PyTorch for autograd support.
-
-        Returns (P_calc, Q_calc) each of shape [N].
-        """
         src, dst = edge_index
         n = va.shape[0]
 
         r = edge_attr_raw["br_r"]
         x = edge_attr_raw["br_x"]
-        b_line = edge_attr_raw["b_fr"] + edge_attr_raw["b_to"]
+        y_complex = 1.0 / torch.complex(r, x)
+        g_s = y_complex.real
+        b_s = y_complex.imag
+
+        g_fr = edge_attr_raw["g_fr"]
+        b_fr = edge_attr_raw["b_fr"]
+        g_to = edge_attr_raw["g_to"]
+        b_to = edge_attr_raw["b_to"]
         tau = edge_attr_raw["tap"]
         shift = edge_attr_raw["shift"]
 
-        y_complex = 1.0 / torch.complex(r, x)
-        Y_real = y_complex.real
-        Y_imag = y_complex.imag
-
         v_i, v_j = vm[src], vm[dst]
         th_i, th_j = va[src], va[dst]
-        d_theta_fwd = th_i - th_j
-        d_theta_rev = th_j - th_i
 
-        P_flow_src = (
-            v_i * v_j / tau * (
-                -Y_real * torch.cos(d_theta_fwd - shift)
-                - Y_imag * torch.sin(d_theta_fwd - shift)
-            )
-            + Y_real * (v_i / tau) ** 2
-        )
-        P_flow_dst = (
-            v_j * v_i / tau * (
-                -Y_real * torch.cos(d_theta_rev - shift)
-                - Y_imag * torch.sin(d_theta_rev - shift)
-            )
-            + Y_real * v_j ** 2
-        )
+        # --- trig terms ------------------------------------------------
+        # From-side angle: θ_i − θ_j − φ
+        cos_f = torch.cos(th_i - th_j - shift)
+        sin_f = torch.sin(th_i - th_j - shift)
+        # To-side angle: θ_j − θ_i + φ   (FIXED sign on φ)
+        cos_t = torch.cos(th_j - th_i + shift)
+        sin_t = torch.sin(th_j - th_i + shift)
 
-        Q_flow_src = (
-            v_i * v_j / tau * (
-                -Y_real * torch.sin(d_theta_fwd - shift)
-                + Y_imag * torch.cos(d_theta_fwd - shift)
-            )
-            - (Y_imag + b_line / 2) * (v_i / tau) ** 2
-        )
-        Q_flow_dst = (
-            v_j * v_i / tau * (
-                -Y_real * torch.sin(d_theta_rev - shift)
-                + Y_imag * torch.cos(d_theta_rev - shift)
-            )
-            - (Y_imag + b_line / 2) * v_j ** 2
-        )
+        vij_tau = v_i * v_j / tau
+
+        # --- from-side (injected at src) --------------------------------
+        P_from = (v_i / tau) ** 2 * (g_s + g_fr) + vij_tau * (-g_s * cos_f - b_s * sin_f)
+        Q_from = -((v_i / tau) ** 2) * (b_s + b_fr) + vij_tau * (-g_s * sin_f + b_s * cos_f)
+
+        # --- to-side (injected at dst) ----------------------------------
+        P_to = v_j ** 2 * (g_s + g_to) + vij_tau * (-g_s * cos_t - b_s * sin_t)
+        Q_to = -(v_j ** 2) * (b_s + b_to) + vij_tau * (-g_s * sin_t + b_s * cos_t)
 
         P_calc = torch.zeros(n, device=va.device, dtype=va.dtype)
-        P_calc = P_calc.scatter_add(0, src, P_flow_src).scatter_add(0, dst, P_flow_dst)
+        P_calc.scatter_add_(0, src, P_from)
+        P_calc.scatter_add_(0, dst, P_to)
         P_calc = P_calc + vm ** 2 * gs
 
         Q_calc = torch.zeros(n, device=va.device, dtype=va.dtype)
-        Q_calc = Q_calc.scatter_add(0, src, Q_flow_src).scatter_add(0, dst, Q_flow_dst)
+        Q_calc.scatter_add_(0, src, Q_from)
+        Q_calc.scatter_add_(0, dst, Q_to)
         Q_calc = Q_calc - vm ** 2 * bs
 
         return P_calc, Q_calc
@@ -262,40 +245,20 @@ class PowerFlowPhysics:
         bus_type: torch.Tensor,
         vm_setpoint: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the 2N-dimensional mismatch vector F(x).
-
-        F is assembled per bus type:
-          PQ  (type 1) : F[i] = P_spec - P_calc,   F[N+i] = Q_spec - Q_calc
-          PV  (type 2) : F[i] = P_spec - P_calc,   F[N+i] = vm - vm_setpoint
-          Slack (type 3): F[i] = va - 0,            F[N+i] = vm - vm_setpoint
-
-        Returns F of shape [2N].
-        """
         n = va.shape[0]
         P_calc, Q_calc = PowerFlowPhysics.compute_power_injections(
-            va, vm, edge_index, edge_attr_raw, gs, bs,
+            va, vm, edge_index, edge_attr_raw, gs, bs
         )
-
         F = torch.zeros(2 * n, device=va.device, dtype=va.dtype)
 
-        pq_mask = bus_type == 1
         pv_mask = bus_type == 2
         sl_mask = bus_type == 3
 
-        # P-equations (first N entries)
         F[:n] = p_spec - P_calc
-        # Override slack P-equation with angle-fixing constraint
-        if sl_mask.any():
-            F[:n][sl_mask] = va[sl_mask] - 0.0
+        F[:n] = torch.where(sl_mask, va, F[:n])
 
-        # Q-equations (last N entries)
         F[n:] = q_spec - Q_calc
-        # Override PV and slack Q-equations with voltage-fixing constraint
-        if pv_mask.any():
-            F[n:][pv_mask] = vm[pv_mask] - vm_setpoint[pv_mask]
-        if sl_mask.any():
-            F[n:][sl_mask] = vm[sl_mask] - vm_setpoint[sl_mask]
-
+        F[n:] = torch.where(pv_mask | sl_mask, vm - vm_setpoint, F[n:])
         return F
 
     @staticmethod
@@ -310,12 +273,9 @@ class PowerFlowPhysics:
         bus_type: torch.Tensor,
         vm_setpoint: torch.Tensor,
     ) -> torch.Tensor:
-        """Wrapper that takes a flat x = [va; vm] and returns F(x)."""
         n = x.shape[0] // 2
-        va = x[:n]
-        vm = x[n:]
         return PowerFlowPhysics.compute_mismatch(
-            va, vm, edge_index, edge_attr_raw,
+            x[:n], x[n:], edge_index, edge_attr_raw,
             p_spec, q_spec, gs, bs, bus_type, vm_setpoint,
         )
 
@@ -324,116 +284,114 @@ class PowerFlowPhysics:
         x: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr_raw: Dict[str, torch.Tensor],
-        p_spec: torch.Tensor,
-        q_spec: torch.Tensor,
         gs: torch.Tensor,
         bs: torch.Tensor,
         bus_type: torch.Tensor,
         vm_setpoint: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute J = dF/dx [2N x 2N] analytically via closed-form pi-model derivatives.
+        """Analytical 2N×2N Jacobian of the mismatch vector F(x).
 
-        Much faster than ``torch.autograd.functional.jacobian`` which requires
-        2N forward passes through the mismatch function.  The analytical version
-        computes all partial derivatives in a single vectorised pass over edges.
+        Handles from-side *and* to-side per directed edge, with the
+        corrected to-side trig angle (θ_j − θ_i + φ).
         """
         n = x.shape[0] // 2
-        va = x[:n]
-        vm = x[n:]
-        device = x.device
-        dtype = x.dtype
+        va, vm = x[:n], x[n:]
+        device, dtype = x.device, x.dtype
 
         src, dst = edge_index
 
         r = edge_attr_raw["br_r"]
-        xr = edge_attr_raw["br_x"]
-        b_line = edge_attr_raw["b_fr"] + edge_attr_raw["b_to"]
+        x_imp = edge_attr_raw["br_x"]
+        y_complex = 1.0 / torch.complex(r, x_imp)
+        g_s = y_complex.real
+        b_s = y_complex.imag
+
+        g_fr = edge_attr_raw["g_fr"]
+        b_fr = edge_attr_raw["b_fr"]
+        g_to = edge_attr_raw["g_to"]
+        b_to = edge_attr_raw["b_to"]
         tau = edge_attr_raw["tap"]
         shift = edge_attr_raw["shift"]
 
-        y_complex = 1.0 / torch.complex(r, xr)
-        Y_r = y_complex.real
-        Y_x = y_complex.imag
+        v_i, v_j = vm[src], vm[dst]
+        th_i, th_j = va[src], va[dst]
 
-        v_a, v_b = vm[src], vm[dst]
-        th_a, th_b = va[src], va[dst]
-        dtf = th_a - th_b
-        dtr = -dtf
+        cos_f = torch.cos(th_i - th_j - shift)
+        sin_f = torch.sin(th_i - th_j - shift)
+        cos_t = torch.cos(th_j - th_i + shift)
+        sin_t = torch.sin(th_j - th_i + shift)
 
-        cos_f = torch.cos(dtf - shift)
-        sin_f = torch.sin(dtf - shift)
-        cos_r = torch.cos(dtr - shift)
-        sin_r = torch.sin(dtr - shift)
+        vij_tau = v_i * v_j / tau
+        A_f = g_s * cos_f + b_s * sin_f
+        B_f = g_s * sin_f - b_s * cos_f
+        A_t = g_s * cos_t + b_s * sin_t
+        B_t = g_s * sin_t - b_s * cos_t
 
-        vab_tau = v_a * v_b / tau
+        # ---- from-side derivatives (affect row = src) ------------------
+        dPfs_dth_src = vij_tau * B_f
+        dPfs_dth_dst = -vij_tau * B_f
+        dPfs_dvm_src = 2.0 * v_i / tau ** 2 * (g_s + g_fr) - (v_j / tau) * A_f
+        dPfs_dvm_dst = -(v_i / tau) * A_f
 
-        # -- Per-edge derivatives of P_flow_src (contributes to P_calc[src]) --
-        dPfs_dth_a = vab_tau * (Y_r * sin_f - Y_x * cos_f)
-        dPfs_dth_b = -dPfs_dth_a
-        dPfs_dv_a = (v_b / tau * (-Y_r * cos_f - Y_x * sin_f)
-                     + 2 * Y_r * v_a / tau ** 2)
-        dPfs_dv_b = v_a / tau * (-Y_r * cos_f - Y_x * sin_f)
+        dQfs_dth_src = -vij_tau * A_f
+        dQfs_dth_dst = vij_tau * A_f
+        dQfs_dvm_src = -2.0 * v_i / tau ** 2 * (b_s + b_fr) - (v_j / tau) * B_f
+        dQfs_dvm_dst = -(v_i / tau) * B_f
 
-        # -- Per-edge derivatives of P_flow_dst (contributes to P_calc[dst]) --
-        dPfd_dth_b = vab_tau * (Y_r * sin_r - Y_x * cos_r)
-        dPfd_dth_a = -dPfd_dth_b
-        dPfd_dv_b = (v_a / tau * (-Y_r * cos_r - Y_x * sin_r)
-                     + 2 * Y_r * v_b)
-        dPfd_dv_a = v_b / tau * (-Y_r * cos_r - Y_x * sin_r)
+        # ---- to-side derivatives (affect row = dst) --------------------
+        dPfd_dth_dst = vij_tau * B_t
+        dPfd_dth_src = -vij_tau * B_t
+        dPfd_dvm_dst = 2.0 * v_j * (g_s + g_to) - (v_i / tau) * A_t
+        dPfd_dvm_src = -(v_j / tau) * A_t
 
-        # -- Per-edge derivatives of Q_flow_src (contributes to Q_calc[src]) --
-        dQfs_dth_a = vab_tau * (-Y_r * cos_f - Y_x * sin_f)
-        dQfs_dth_b = -dQfs_dth_a
-        dQfs_dv_a = (v_b / tau * (-Y_r * sin_f + Y_x * cos_f)
-                     - 2 * (Y_x + b_line / 2) * v_a / tau ** 2)
-        dQfs_dv_b = v_a / tau * (-Y_r * sin_f + Y_x * cos_f)
+        dQfd_dth_dst = -vij_tau * A_t
+        dQfd_dth_src = vij_tau * A_t
+        dQfd_dvm_dst = -2.0 * v_j * (b_s + b_to) - (v_i / tau) * B_t
+        dQfd_dvm_src = -(v_j / tau) * B_t
 
-        # -- Per-edge derivatives of Q_flow_dst (contributes to Q_calc[dst]) --
-        dQfd_dth_b = vab_tau * (-Y_r * cos_r - Y_x * sin_r)
-        dQfd_dth_a = -dQfd_dth_b
-        dQfd_dv_b = (v_a / tau * (-Y_r * sin_r + Y_x * cos_r)
-                     - 2 * (Y_x + b_line / 2) * v_b)
-        dQfd_dv_a = v_b / tau * (-Y_r * sin_r + Y_x * cos_r)
+        # ---- assemble sub-blocks (F = spec − calc ⇒ dF/d· = −d calc/d·)
+        _r = torch.cat  # alias for readability
 
-        # -- Assemble four N×N sub-blocks via scatter_add --
-        # F = [p_spec - P_calc ; q_spec - Q_calc], so dF/dx = -dCalc/dx
-        z = torch.zeros(n * n, device=device, dtype=dtype)
+        dFP_dva = _scatter_to_block(
+            _r([src, src, dst, dst]),
+            _r([src, dst, dst, src]),
+            _r([-dPfs_dth_src, -dPfs_dth_dst, -dPfd_dth_dst, -dPfd_dth_src]),
+            n,
+        )
 
-        # Block (0,0): dF_P / d_va  =  -dP_calc / d_va
-        b00 = z.scatter_add(0, src * n + src, -dPfs_dth_a)
-        b00 = b00.scatter_add(0, src * n + dst, -dPfs_dth_b)
-        b00 = b00.scatter_add(0, dst * n + dst, -dPfd_dth_b)
-        b00 = b00.scatter_add(0, dst * n + src, -dPfd_dth_a)
-        dFP_dva = b00.view(n, n)
+        dFP_dvm = (
+            _scatter_to_block(
+                _r([src, src, dst, dst]),
+                _r([src, dst, dst, src]),
+                _r([-dPfs_dvm_src, -dPfs_dvm_dst, -dPfd_dvm_dst, -dPfd_dvm_src]),
+                n,
+            )
+            - torch.diag(2.0 * vm * gs)
+        )
 
-        # Block (0,1): dF_P / d_vm  =  -dP_calc / d_vm
-        b01 = z.scatter_add(0, src * n + src, -dPfs_dv_a)
-        b01 = b01.scatter_add(0, src * n + dst, -dPfs_dv_b)
-        b01 = b01.scatter_add(0, dst * n + dst, -dPfd_dv_b)
-        b01 = b01.scatter_add(0, dst * n + src, -dPfd_dv_a)
-        dFP_dvm = b01.view(n, n) - torch.diag(2 * vm * gs)
+        dFQ_dva = _scatter_to_block(
+            _r([src, src, dst, dst]),
+            _r([src, dst, dst, src]),
+            _r([-dQfs_dth_src, -dQfs_dth_dst, -dQfd_dth_dst, -dQfd_dth_src]),
+            n,
+        )
 
-        # Block (1,0): dF_Q / d_va  =  -dQ_calc / d_va
-        b10 = z.scatter_add(0, src * n + src, -dQfs_dth_a)
-        b10 = b10.scatter_add(0, src * n + dst, -dQfs_dth_b)
-        b10 = b10.scatter_add(0, dst * n + dst, -dQfd_dth_b)
-        b10 = b10.scatter_add(0, dst * n + src, -dQfd_dth_a)
-        dFQ_dva = b10.view(n, n)
+        dFQ_dvm = (
+            _scatter_to_block(
+                _r([src, src, dst, dst]),
+                _r([src, dst, dst, src]),
+                _r([-dQfs_dvm_src, -dQfs_dvm_dst, -dQfd_dvm_dst, -dQfd_dvm_src]),
+                n,
+            )
+            + torch.diag(2.0 * vm * bs)
+        )
 
-        # Block (1,1): dF_Q / d_vm  =  -dQ_calc / d_vm
-        # Shunt term:  d(-Q_calc)/d_vm  for shunt is +2*vm*bs
-        b11 = z.scatter_add(0, src * n + src, -dQfs_dv_a)
-        b11 = b11.scatter_add(0, src * n + dst, -dQfs_dv_b)
-        b11 = b11.scatter_add(0, dst * n + dst, -dQfd_dv_b)
-        b11 = b11.scatter_add(0, dst * n + src, -dQfd_dv_a)
-        dFQ_dvm = b11.view(n, n) + torch.diag(2 * vm * bs)
+        J = torch.cat(
+            [torch.cat([dFP_dva, dFP_dvm], dim=1), torch.cat([dFQ_dva, dFQ_dvm], dim=1)],
+            dim=0,
+        )
 
-        J = torch.cat([
-            torch.cat([dFP_dva, dFP_dvm], dim=1),
-            torch.cat([dFQ_dva, dFQ_dvm], dim=1),
-        ], dim=0)
-
-        # -- Bus-type row overrides (non-in-place for autograd safety) --
+        # ---- bus-type row overrides ------------------------------------
         sl_mask = bus_type == 3
         pv_mask = bus_type == 2
 
@@ -442,151 +400,222 @@ class PowerFlowPhysics:
         keep = torch.cat([keep_p, keep_q]).unsqueeze(1)
         J = J * keep
 
-        override_diag = torch.zeros(2 * n, device=device, dtype=dtype)
-        override_diag[:n] = sl_mask.float()
-        override_diag[n:] = (pv_mask | sl_mask).float()
-        J = J + torch.diag(override_diag)
-
+        override = torch.zeros(2 * n, device=device, dtype=dtype)
+        override[:n] = sl_mask.float()
+        override[n:] = (pv_mask | sl_mask).float()
+        J = J + torch.diag(override)
         return J
 
-class SharedEncoder(nn.Module):
-    """Message-passing encoder producing per-node embeddings H ∈ R^{N×d}.
 
-    Uses GINEConv layers (Graph Isomorphism Network with Edge features)
-    with residual connections and layer normalisation.
+def _verify_jacobian(x, edge_index, ear, gs, bs, bt, vm_sp, eps=1e-5):
+    """Finite-difference Jacobian for debugging (never used in training)."""
+    n2 = x.shape[0]
+    J_fd = torch.zeros(n2, n2, device=x.device, dtype=x.dtype)
+    F0 = PowerFlowPhysics.compute_mismatch_from_x(x, edge_index, ear,
+                                                    torch.zeros_like(gs), torch.zeros_like(gs),
+                                                    gs, bs, bt, vm_sp)
+    for i in range(n2):
+        xp = x.clone()
+        xp[i] += eps
+        Fp = PowerFlowPhysics.compute_mismatch_from_x(xp, edge_index, ear,
+                                                        torch.zeros_like(gs), torch.zeros_like(gs),
+                                                        gs, bs, bt, vm_sp)
+        J_fd[:, i] = (Fp - F0) / eps
+    return J_fd
+
+
+# ============================================================================
+# NEURAL NETWORK COMPONENTS
+# ============================================================================
+class GraphTransformerLayer(nn.Module):
+    """Global self-attention over nodes within each graph.
+
+    Pads variable-size graphs to the batch maximum, applies multi-head
+    attention with key-padding masks, then unpads.  Complexity is
+    O(N_max² · B) per layer.
     """
 
-    def __init__(self, node_dim: int = 7, edge_dim: int = 8,
-                 hidden_dim: int = 128, num_layers: int = 4,
-                 dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, H: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        _, counts = torch.unique_consecutive(batch, return_counts=True)
+        max_n = counts.max().item()
+        B = counts.shape[0]
+        d = H.shape[1]
+        dev, dt = H.device, H.dtype
+
+        padded = torch.zeros(B, max_n, d, device=dev, dtype=dt)
+        key_pad = torch.ones(B, max_n, dtype=torch.bool, device=dev)
+
+        splits = torch.split(H, counts.tolist())
+        for i, h in enumerate(splits):
+            ni = h.shape[0]
+            padded[i, :ni] = h
+            key_pad[i, :ni] = False
+
+        attn_out, _ = self.mha(padded, padded, padded, key_padding_mask=key_pad)
+        padded = self.norm1(padded + attn_out)
+        padded = self.norm2(padded + self.ffn(padded))
+
+        parts = [padded[i, : counts[i]] for i in range(B)]
+        return torch.cat(parts, dim=0)
+
+
+class SharedEncoder(nn.Module):
+    """GINEConv message-passing + optional global graph-transformer."""
+
+    def __init__(
+        self,
+        node_dim: int = 7,
+        edge_dim: int = 8,
+        hidden_dim: int = 128,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+        use_global_attention: bool = True,
+        num_attention_heads: int = 4,
+    ):
         super().__init__()
         self.node_proj = nn.Linear(node_dim, hidden_dim)
-
         self.edge_proj = nn.Sequential(
-            nn.Linear(edge_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(edge_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
         )
-
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
             mlp = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
             )
             self.convs.append(GINEConv(nn=mlp, edge_dim=hidden_dim))
             self.norms.append(nn.LayerNorm(hidden_dim))
+        self.drop = nn.Dropout(dropout)
 
-        self.dropout = nn.Dropout(dropout)
+        self.use_global_attention = use_global_attention
+        if use_global_attention:
+            self.transformer = GraphTransformerLayer(hidden_dim, num_attention_heads, dropout)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
-                edge_attr: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         h = self.node_proj(x)
         e = self.edge_proj(edge_attr)
-
         for conv, norm in zip(self.convs, self.norms):
             h_new = conv(h, edge_index, e)
             h_new = norm(h_new)
             h_new = F_func.leaky_relu(h_new)
-            h_new = self.dropout(h_new)
-            h = h + h_new  # residual
+            h_new = self.drop(h_new)
+            h = h + h_new
+        if self.use_global_attention and batch is not None:
+            h = self.transformer(h, batch)
         return h
 
 
-
 class StatePredictorHead(nn.Module):
-    """Maps node embeddings H → x_pred ∈ R^{2N}.
-
-    Predicts (Δva, Δvm) per node, added to a flat-start initialisation:
-      PQ  : va=0, vm=1
-      PV  : va=0, vm=vm_setpoint
-      Slack: va=0, vm=vm_setpoint
-    """
+    """Maps H → x_pred, predicting (Δva, Δvm) relative to flat start."""
 
     def __init__(self, hidden_dim: int = 128):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 2)
         )
 
-    def forward(self, H: torch.Tensor, bus_type: torch.Tensor,
-                vm_setpoint: torch.Tensor) -> torch.Tensor:
-        """Return x_pred [2N] = [va_0..va_{N-1}, vm_0..vm_{N-1}]."""
-        delta = self.mlp(H)  # [N, 2]  (Δva, Δvm)
+    def forward(
+        self,
+        H: torch.Tensor,
+        bus_type: torch.Tensor,
+        vm_setpoint: torch.Tensor,
+    ) -> torch.Tensor:
+        delta = self.mlp(H)
         n = H.shape[0]
-
         va_init = torch.zeros(n, device=H.device, dtype=H.dtype)
         vm_init = torch.ones(n, device=H.device, dtype=H.dtype)
+        pv_or_sl = (bus_type == 2) | (bus_type == 3)
+        vm_init = torch.where(pv_or_sl, vm_setpoint, vm_init)
+        return torch.cat([va_init + delta[:, 0], vm_init + delta[:, 1]], dim=0)
 
-        pv_or_slack = (bus_type == 2) | (bus_type == 3)
-        vm_init[pv_or_slack] = vm_setpoint[pv_or_slack]
-
-        va_pred = va_init + delta[:, 0]
-        vm_pred = vm_init + delta[:, 1]
-
-        return torch.cat([va_pred, vm_pred], dim=0)
 
 class RegularizerHead(nn.Module):
-    """Maps node embeddings H → (D, U, S) defining Λ = D + U S Uᵀ.
-
-    D ∈ R^{2N}  non-negative diagonal (softplus)
-    U ∈ R^{2N×k}  low-rank coupling basis
-    S ∈ R^{k}     positive diagonal weights (softplus)
-    """
+    """Predicts per-graph Λ = diag(d) + U diag(s) Uᵀ."""
 
     def __init__(self, hidden_dim: int = 128, rank_k: int = 8):
         super().__init__()
         self.rank_k = rank_k
-
         self.d_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 2)
         )
-
         self.u_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2 * rank_k),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 2 * rank_k)
         )
-
         self.s_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, rank_k),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, rank_k)
         )
 
-    def forward(self, H: torch.Tensor, batch: torch.Tensor):
-        """Return per-graph (D, U, S) packed into a list of tuples.
+    def forward(
+        self, H: torch.Tensor, batch: torch.Tensor
+    ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        d_raw = self.d_mlp(H)
+        u_raw = self.u_mlp(H)
+        h_pool = global_mean_pool(H, batch)
+        s_raw = self.s_mlp(h_pool)
 
-        Because graphs in a batch may have different sizes, outputs are
-        returned as lists indexed by graph id.  Each element is a tuple
-        (d [2n], U [2n, k], s [k]) for that graph.
-        """
-        d_raw = self.d_mlp(H)       # [N_total, 2]
-        u_raw = self.u_mlp(H)       # [N_total, 2k]
-        h_pool = global_mean_pool(H, batch)  # [B, hidden_dim]
-        s_raw = self.s_mlp(h_pool)   # [B, k]
+        d_all = F_func.softplus(d_raw)
+        s_all = F_func.softplus(s_raw)
 
-        d_all = F_func.softplus(d_raw)       # [N_total, 2]
-        s_all = F_func.softplus(s_raw)       # [B, k]
+        _, counts = torch.unique_consecutive(batch, return_counts=True)
+        splits_d = torch.split(d_all, counts.tolist())
+        splits_u = torch.split(u_raw, counts.tolist())
 
-        unique_graphs = batch.unique()
-        results = []
-        for g in unique_graphs:
-            mask = batch == g
-            n_g = mask.sum().item()
-            d_g = d_all[mask].reshape(2 * n_g)           # [2n]
-            u_g = u_raw[mask].reshape(2 * n_g, self.rank_k)  # [2n, k]
-            s_g = s_all[g]                                    # [k]
-            results.append((d_g, u_g, s_g))
-
+        results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for i, (d_g, u_g) in enumerate(zip(splits_d, splits_u)):
+            n_g = d_g.shape[0]
+            results.append(
+                (
+                    d_g.reshape(2 * n_g),
+                    u_g.reshape(2 * n_g, self.rank_k),
+                    s_all[i],
+                )
+            )
         return results
-    
+
+
+class InfeasibilityHead(nn.Module):
+    """Graph-level binary classifier: feasible (logit > 0) vs infeasible."""
+
+    def __init__(self, hidden_dim: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.gate = nn.Linear(hidden_dim, 1)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, H: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        w = torch.sigmoid(self.gate(H))
+        h_graph = global_add_pool(H * w, batch)
+        return self.classifier(h_graph).squeeze(-1)
+
+
+# ============================================================================
+# SOLVER HELPERS
+# ============================================================================
 def _solve_regularised_step(
     J: torch.Tensor,
     F_val: torch.Tensor,
@@ -594,190 +623,58 @@ def _solve_regularised_step(
     U: torch.Tensor,
     s: torch.Tensor,
 ) -> torch.Tensor:
-    """Solve the regularised Newton sub-problem for Δx.
-
-    Solves the normal equations of min ||A Δx - b||²:
-
-        (Jᵀ J + Λ) Δx = -Jᵀ F,     Λ = diag(d) + U diag(s) Uᵀ
-
-    Uses a single [2N, 2N] linear solve instead of constructing the
-    tall stacked matrix and calling lstsq.
-
-    Parameters
-    ----------
-    J : [2N, 2N]   Jacobian
-    F_val : [2N]   mismatch vector F(x_t)
-    d : [2N]       diagonal damping  (non-negative)
-    U : [2N, k]    low-rank basis
-    s : [k]        positive diagonal weights
-
-    Returns
-    -------
-    dx : [2N]
-    """
-    JtJ = J.T @ J
-    Lambda = torch.diag(d) + U @ torch.diag(s) @ U.T
-    H = JtJ + Lambda
-    rhs = -(J.T @ F_val)
-    dx = torch.linalg.solve(H, rhs.unsqueeze(-1)).squeeze(-1)
-    return dx
+    dim = J.shape[0]
+    k = U.shape[1]
+    D_sqrt = torch.diag(d.sqrt())
+    V = torch.diag(s.sqrt()) @ U.T
+    A = torch.cat([J, D_sqrt, V], dim=0)
+    b = torch.cat([-F_val, torch.zeros(dim + k, device=J.device, dtype=J.dtype)])
+    return torch.linalg.lstsq(A, b.unsqueeze(-1)).solution.squeeze(-1)
 
 
-class ImplicitSolverFn(torch.autograd.Function):
-    """Custom autograd function implementing implicit differentiation.
-
-    Forward runs the Newton loop *without* building the unrolled graph.
-    Backward applies the implicit function theorem at the converged point.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        x_pred: torch.Tensor,
-        d: torch.Tensor,
-        U: torch.Tensor,
-        s: torch.Tensor,
-        T: int,
-        edge_index: torch.Tensor,
-        edge_attr_raw_flat: torch.Tensor,
-        p_spec: torch.Tensor,
-        q_spec: torch.Tensor,
-        gs: torch.Tensor,
-        bs: torch.Tensor,
-        bus_type: torch.Tensor,
-        vm_setpoint: torch.Tensor,
-        edge_attr_keys: list,
-    ):
-        n = x_pred.shape[0] // 2
-        ea_raw = _unflatten_edge_attr(edge_attr_raw_flat, edge_attr_keys)
-
-        x = x_pred.detach().clone()
-        residual_norms = []
-
-        epsilon = 1e-7
-        for _ in range(T):
-            with torch.no_grad():
-                F_val = PowerFlowPhysics.compute_mismatch_from_x(
-                    x, edge_index, ea_raw,
-                    p_spec, q_spec, gs, bs, bus_type, vm_setpoint,
-                )
-                res_norm = F_val.abs().max().item()
-                residual_norms.append(res_norm)
-                if res_norm < epsilon:
-                    break
-                J = PowerFlowPhysics.compute_jacobian(
-                    x, edge_index, ea_raw,
-                    p_spec, q_spec, gs, bs, bus_type, vm_setpoint,
-                )
-                dx = _solve_regularised_step(J, F_val, d.detach(), U.detach(), s.detach())
-                x = x + dx
-
-        ctx.save_for_backward(x, d, U, s, edge_index, edge_attr_raw_flat,
-                              p_spec, q_spec, gs, bs, bus_type, vm_setpoint,
-                              x_pred)
-        ctx.edge_attr_keys = edge_attr_keys
-        ctx.residual_norms = residual_norms
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x_star, d, U, s, edge_index, ea_flat,
-         p_spec, q_spec, gs, bs, bus_type, vm_setpoint,
-         x_pred) = ctx.saved_tensors
-        ea_raw = _unflatten_edge_attr(ea_flat, ctx.edge_attr_keys)
-
-        J = PowerFlowPhysics.compute_jacobian(
-            x_star, edge_index, ea_raw,
-            p_spec, q_spec, gs, bs, bus_type, vm_setpoint,
-        )
-
-        Lambda = torch.diag(d) + U @ torch.diag(s) @ U.T
-        H = J.T @ J + Lambda
-        v = torch.linalg.solve(H, grad_output.unsqueeze(-1)).squeeze(-1)
-
-        grad_x_pred = Lambda @ v
-        diff = (x_star - x_pred).detach()
-        grad_d = v * diff
-        grad_U = torch.outer(diff, v) @ U @ torch.diag(s) + \
-                 torch.outer(v, diff) @ U @ torch.diag(s)
-        grad_U = grad_U.T.T  # keep shape [2N, k]
-        grad_s = (U.T @ torch.outer(v, diff) @ U).diag()
-
-        return (grad_x_pred, grad_d, grad_U, grad_s,
-                None, None, None, None, None, None, None, None, None, None)
+def _solve_lm_step(
+    J: torch.Tensor,
+    F_val: torch.Tensor,
+    mu_sqrt: float,
+) -> torch.Tensor:
+    dim = J.shape[0]
+    device, dtype = J.device, J.dtype
+    Lambda_sqrt = mu_sqrt * torch.eye(dim, device=device, dtype=dtype)
+    A = torch.cat([J, Lambda_sqrt], dim=0)
+    b = torch.cat([-F_val, torch.zeros(dim, device=device, dtype=dtype)])
+    return torch.linalg.lstsq(A, b.unsqueeze(-1)).solution.squeeze(-1)
 
 
-def _flatten_edge_attr(ea_raw: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, list]:
-    """Pack edge-attr dict into a single tensor for save_for_backward."""
-    keys = sorted(ea_raw.keys())
-    tensors = [ea_raw[k] for k in keys]
-    return torch.stack(tensors, dim=-1), keys
+def _project_voltage(x: torch.Tensor, vm_min: float, vm_max: float) -> torch.Tensor:
+    """Clamp voltage magnitudes to [vm_min, vm_max]."""
+    n = x.shape[0] // 2
+    va = x[:n]
+    vm = x[n:].clamp(min=vm_min, max=vm_max)
+    return torch.cat([va, vm])
 
 
-def _unflatten_edge_attr(flat: torch.Tensor, keys: list) -> Dict[str, torch.Tensor]:
-    """Unpack the flat tensor back to a dict."""
-    return {k: flat[:, i] for i, k in enumerate(keys)}
-
-
+# ============================================================================
+# UNROLLED SOLVER (BPTT only)
+# ============================================================================
 class UnrolledSolver(nn.Module):
-    """Differentiable unrolled Newton-Raphson with regularisation.
+    """Differentiable Newton-Raphson with back-propagation through time."""
 
-    Supports two execution paths:
-      - **Batched** (default): groups same-size graphs, stacks tensors, and
-        runs a single ``torch.linalg.solve`` per solver step.
-      - **Implicit differentiation**: per-graph ``ImplicitSolverFn`` (custom
-        autograd backward via the implicit function theorem).
-    """
-
-    def __init__(self, T: int = 5, use_implicit_diff: bool = False,
-                 epsilon: float = 1e-7):
+    def __init__(self, T: int = 5, epsilon: float = 1e-7, vm_min: float = 0.5, vm_max: float = 1.5):
         super().__init__()
         self.T = T
-        self.use_implicit_diff = use_implicit_diff
         self.epsilon = epsilon
+        self.vm_min = vm_min
+        self.vm_max = vm_max
 
     # ------------------------------------------------------------------ #
-    #  Single-graph path (used by ImplicitSolverFn)                       #
+    #  Learned regulariser — batched by same-size graph groups            #
     # ------------------------------------------------------------------ #
-
-    def forward_single_graph(
-        self,
-        x_pred: torch.Tensor,
-        d: torch.Tensor,
-        U: torch.Tensor,
-        s: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr_raw: Dict[str, torch.Tensor],
-        p_spec: torch.Tensor,
-        q_spec: torch.Tensor,
-        gs: torch.Tensor,
-        bs_node: torch.Tensor,
-        bus_type: torch.Tensor,
-        vm_setpoint: torch.Tensor,
-    ) -> Tuple[torch.Tensor, List[float]]:
-        """Run the unrolled solver on a single graph."""
-        ea_flat, ea_keys = _flatten_edge_attr(edge_attr_raw)
-        x_final = ImplicitSolverFn.apply(
-            x_pred, d, U, s, self.T,
-            edge_index, ea_flat,
-            p_spec, q_spec, gs, bs_node, bus_type, vm_setpoint,
-            ea_keys,
-        )
-        return x_final, []
-
-    def forward_batch(
+    def forward_batch_regularised(
         self,
         x_pred_list: List[torch.Tensor],
         reg_params: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         per_graph: List[Dict[str, torch.Tensor]],
     ) -> Tuple[List[torch.Tensor], List[List[float]]]:
-        """Run the solver on a batch of graphs with batched linear solves.
-
-        Groups graphs by node count so that ``torch.linalg.solve`` processes
-        all same-size graphs in a single kernel call per solver step.
-
-        Returns (x_final_list, residuals_list) in the original graph order.
-        """
         B = len(x_pred_list)
         device = x_pred_list[0].device
         dtype = x_pred_list[0].dtype
@@ -786,86 +683,192 @@ class UnrolledSolver(nn.Module):
         for i, gi in enumerate(per_graph):
             groups.setdefault(gi["n"], []).append(i)
 
-        x_final_out: List[torch.Tensor] = [torch.empty(0)] * B
+        x_final_out: List[Optional[torch.Tensor]] = [None] * B
         residuals_out: List[List[float]] = [[] for _ in range(B)]
 
         for n_nodes, indices in groups.items():
             Bg = len(indices)
             dim = 2 * n_nodes
+            k = reg_params[indices[0]][1].shape[1]
 
-            x = torch.stack([x_pred_list[i] for i in indices])        # [Bg, 2N]
-            d_b = torch.stack([reg_params[i][0] for i in indices])    # [Bg, 2N]
-            U_b = torch.stack([reg_params[i][1] for i in indices])    # [Bg, 2N, k]
-            s_b = torch.stack([reg_params[i][2] for i in indices])    # [Bg, k]
-
-            Lambda = (torch.diag_embed(d_b)
-                      + U_b @ torch.diag_embed(s_b) @ U_b.transpose(1, 2))
-
+            x = torch.stack([x_pred_list[i] for i in indices])
+            d_b = torch.stack([reg_params[i][0] for i in indices])
+            U_b = torch.stack([reg_params[i][1] for i in indices])
+            s_b = torch.stack([reg_params[i][2] for i in indices])
             g_infos = [per_graph[i] for i in indices]
 
+            D_sqrt_b = torch.diag_embed(d_b.sqrt())
+            V_b = torch.diag_embed(s_b.sqrt()) @ U_b.transpose(1, 2)
+
             for _t in range(self.T):
-                F_list = []
-                J_list = []
-                for b in range(Bg):
-                    gi = g_infos[b]
-                    F_val = PowerFlowPhysics.compute_mismatch_from_x(
-                        x[b], gi["edge_index"], gi["edge_attr_raw"],
-                        gi["p_spec"], gi["q_spec"],
-                        gi["gs"], gi["bs"], gi["bus_type"], gi["vm_setpoint"],
-                    )
-                    J_val = PowerFlowPhysics.compute_jacobian(
-                        x[b], gi["edge_index"], gi["edge_attr_raw"],
-                        gi["p_spec"], gi["q_spec"],
-                        gi["gs"], gi["bs"], gi["bus_type"], gi["vm_setpoint"],
-                    )
-                    F_list.append(F_val)
-                    J_list.append(J_val)
+                # Force float32 for linear algebra regardless of AMP
+                with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
+                    x_f32 = x.float()
 
-                F_batch = torch.stack(F_list)              # [Bg, 2N]
+                    F_list, J_list = [], []
+                    for b in range(Bg):
+                        gi = g_infos[b]
+                        F_val = PowerFlowPhysics.compute_mismatch_from_x(
+                            x_f32[b], gi["edge_index"], gi["edge_attr_raw"],
+                            gi["p_spec"], gi["q_spec"],
+                            gi["gs"], gi["bs"], gi["bus_type"], gi["vm_setpoint"],
+                        )
+                        J_val = PowerFlowPhysics.compute_jacobian(
+                            x_f32[b], gi["edge_index"], gi["edge_attr_raw"],
+                            gi["gs"], gi["bs"], gi["bus_type"], gi["vm_setpoint"],
+                        )
+                        F_list.append(F_val)
+                        J_list.append(J_val)
 
-                max_res = F_batch.detach().abs().amax(dim=1).max().item()
-                if max_res < self.epsilon:
-                    break
+                    F_batch = torch.stack(F_list)
+                    max_res = F_batch.detach().abs().amax(dim=1).max().item()
+                    if max_res < self.epsilon:
+                        break
 
-                J_batch = torch.stack(J_list)              # [Bg, 2N, 2N]
+                    J_batch = torch.stack(J_list)
+                    A = torch.cat([J_batch, D_sqrt_b.float(), V_b.float()], dim=1)
+                    b_rhs = torch.cat([
+                        -F_batch,
+                        torch.zeros(Bg, dim + k, device=device, dtype=torch.float32),
+                    ], dim=1)
+                    dx = torch.linalg.lstsq(A, b_rhs.unsqueeze(-1)).solution.squeeze(-1)
 
-                JtJ = J_batch.transpose(1, 2) @ J_batch   # [Bg, 2N, 2N]
-                H = JtJ + Lambda                           # [Bg, 2N, 2N]
-                rhs = -(J_batch.transpose(1, 2)
-                        @ F_batch.unsqueeze(-1)).squeeze(-1)  # [Bg, 2N]
-
-                dx = torch.linalg.solve(H, rhs.unsqueeze(-1)).squeeze(-1)
-                x = x + dx
+                x = x + dx.to(x.dtype)
+                x = torch.stack([_project_voltage(x[b], self.vm_min, self.vm_max) for b in range(Bg)])
 
             for b, idx in enumerate(indices):
                 x_final_out[idx] = x[b]
+                residuals_out[idx] = [F_list[b].detach().abs().max().item()] if F_list else []
 
-        return x_final_out, residuals_out
+        return x_final_out, residuals_out  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ #
+    #  Adaptive LM — batched, mu detached                                 #
+    # ------------------------------------------------------------------ #
+    def forward_batch_adaptive_lm(
+        self,
+        x_pred_list: List[torch.Tensor],
+        per_graph: List[Dict[str, torch.Tensor]],
+        cfg: Config,
+    ) -> Tuple[List[torch.Tensor], List[List[float]], List[float]]:
+        B = len(x_pred_list)
+        device = x_pred_list[0].device
+
+        groups: Dict[int, List[int]] = {}
+        for i, gi in enumerate(per_graph):
+            groups.setdefault(gi["n"], []).append(i)
+
+        x_final_out: List[Optional[torch.Tensor]] = [None] * B
+        residuals_out: List[List[float]] = [[] for _ in range(B)]
+        mu_out: List[float] = [cfg.mu_init] * B
+
+        for n_nodes, indices in groups.items():
+            Bg = len(indices)
+            dim = 2 * n_nodes
+
+            x = torch.stack([x_pred_list[i] for i in indices])
+            mu = torch.full((Bg,), cfg.mu_init, device=device, dtype=torch.float32)
+            g_infos = [per_graph[i] for i in indices]
+
+            for _t in range(self.T):
+                with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
+                    x_f32 = x.float()
+                    F_list, J_list = [], []
+                    for b in range(Bg):
+                        gi = g_infos[b]
+                        F_val = PowerFlowPhysics.compute_mismatch_from_x(
+                            x_f32[b], gi["edge_index"], gi["edge_attr_raw"],
+                            gi["p_spec"], gi["q_spec"],
+                            gi["gs"], gi["bs"], gi["bus_type"], gi["vm_setpoint"],
+                        )
+                        J_val = PowerFlowPhysics.compute_jacobian(
+                            x_f32[b], gi["edge_index"], gi["edge_attr_raw"],
+                            gi["gs"], gi["bs"], gi["bus_type"], gi["vm_setpoint"],
+                        )
+                        F_list.append(F_val)
+                        J_list.append(J_val)
+
+                    F_batch = torch.stack(F_list)
+                    max_res = F_batch.detach().abs().amax(dim=1).max().item()
+                    if max_res < self.epsilon:
+                        break
+
+                    J_batch = torch.stack(J_list)
+
+                    mu_sqrt = mu.detach().sqrt().view(Bg, 1, 1)
+                    eye = torch.eye(dim, device=device, dtype=torch.float32).unsqueeze(0)
+                    Lambda_sqrt = mu_sqrt * eye.expand(Bg, -1, -1)
+                    A = torch.cat([J_batch, Lambda_sqrt], dim=1)
+                    b_rhs = torch.cat([
+                        -F_batch,
+                        torch.zeros(Bg, dim, device=device, dtype=torch.float32),
+                    ], dim=1)
+                    dx = torch.linalg.lstsq(A, b_rhs.unsqueeze(-1)).solution.squeeze(-1)
+
+                x_new = x + dx.to(x.dtype)
+                x_new = torch.stack([
+                    _project_voltage(x_new[b], self.vm_min, self.vm_max) for b in range(Bg)
+                ])
+
+                with torch.no_grad():
+                    new_res_list = []
+                    for b in range(Bg):
+                        gi = g_infos[b]
+                        Fn = PowerFlowPhysics.compute_mismatch_from_x(
+                            x_new[b].float(), gi["edge_index"], gi["edge_attr_raw"],
+                            gi["p_spec"], gi["q_spec"],
+                            gi["gs"], gi["bs"], gi["bus_type"], gi["vm_setpoint"],
+                        )
+                        new_res_list.append(Fn.abs().max())
+                    new_res = torch.stack(new_res_list)
+                    old_res = F_batch.detach().abs().amax(dim=1)
+                    improved = new_res < old_res
+                    mu = torch.where(
+                        improved,
+                        (mu * cfg.mu_decrease).clamp(min=cfg.mu_min),
+                        (mu * cfg.mu_increase).clamp(max=cfg.mu_max),
+                    )
+
+                x = torch.where(improved.unsqueeze(1), x_new, x)
+
+            for b, idx in enumerate(indices):
+                x_final_out[idx] = x[b]
+                mu_out[idx] = mu[b].item()
+                if F_list:
+                    residuals_out[idx] = [F_list[b].detach().abs().max().item()]
+
+        return x_final_out, residuals_out, mu_out  # type: ignore[return-value]
 
 
+# ============================================================================
+# MAIN MODEL
+# ============================================================================
 class BifurcationAwarePFSolver(nn.Module):
-    """Complete model combining encoder, dual heads, and unrolled solver.
-
-    Registers normalisation stats as buffers so they travel with the model.
-    """
-
     def __init__(self, cfg: Config, norm_stats: Dict[str, torch.Tensor]):
         super().__init__()
         self.cfg = cfg
 
         self.encoder = SharedEncoder(
-            node_dim=7, edge_dim=8,
+            node_dim=7,
+            edge_dim=8,
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_mp_layers,
             dropout=cfg.dropout,
+            use_global_attention=cfg.use_global_attention,
+            num_attention_heads=cfg.num_attention_heads,
         )
         self.state_head = StatePredictorHead(hidden_dim=cfg.hidden_dim)
-        self.reg_head = RegularizerHead(
-            hidden_dim=cfg.hidden_dim, rank_k=cfg.rank_k,
+        self.infeasibility_head = InfeasibilityHead(
+            hidden_dim=cfg.hidden_dim, dropout=cfg.dropout
         )
+
+        if not cfg.use_adaptive_lm:
+            self.reg_head = RegularizerHead(hidden_dim=cfg.hidden_dim, rank_k=cfg.rank_k)
+        else:
+            self.reg_head = None
+
         self.solver = UnrolledSolver(
-            T=cfg.T, use_implicit_diff=cfg.use_implicit_diff,
-            epsilon=cfg.epsilon,
+            T=cfg.T, epsilon=cfg.epsilon, vm_min=cfg.vm_min, vm_max=cfg.vm_max
         )
 
         self.register_buffer("x_mean", norm_stats["x_mean"])
@@ -873,96 +876,100 @@ class BifurcationAwarePFSolver(nn.Module):
         self.register_buffer("edge_mean", norm_stats["edge_mean"])
         self.register_buffer("edge_std", norm_stats["edge_std"])
 
+    # ------------------------------------------------------------------ #
     def _extract_per_graph(
-        self, data: Batch, node_raw: Dict[str, torch.Tensor],
+        self, data: Batch, node_raw: Dict[str, torch.Tensor]
     ) -> List[Dict[str, torch.Tensor]]:
-        """Extract raw physics quantities for each graph in the batch."""
-        edge_raw = denormalize_edge_features(
-            data.edge_attr, self.edge_mean, self.edge_std,
-        )
+        edge_raw = denormalize_edge_features(data.edge_attr, self.edge_mean, self.edge_std)
         batch_idx = data.batch
         edge_src = data.edge_index[0]
+        edge_dst = data.edge_index[1]
 
-        unique_graphs = batch_idx.unique()
-        per_graph = []
+        _, counts = torch.unique_consecutive(batch_idx, return_counts=True)
+        offsets = torch.zeros(counts.shape[0] + 1, dtype=torch.long, device=counts.device)
+        offsets[1:] = counts.cumsum(0)
 
-        for g in unique_graphs:
-            node_mask = batch_idx == g
-            n_g = node_mask.sum().item()
-            node_offset = node_mask.nonzero(as_tuple=True)[0][0].item()
+        per_graph: List[Dict[str, torch.Tensor]] = []
+        for g_idx in range(counts.shape[0]):
+            lo = offsets[g_idx].item()
+            hi = offsets[g_idx + 1].item()
+            n_g = hi - lo
 
-            edge_mask = (edge_src >= node_offset) & (edge_src < node_offset + n_g)
-            ei_g = data.edge_index[:, edge_mask] - node_offset
-
+            edge_mask = (
+                (edge_src >= lo) & (edge_src < hi) & (edge_dst >= lo) & (edge_dst < hi)
+            )
+            ei_g = data.edge_index[:, edge_mask] - lo
             ea_g = {k: v[edge_mask] for k, v in edge_raw.items()}
 
-            per_graph.append({
-                "edge_index": ei_g,
-                "edge_attr_raw": ea_g,
-                "p_spec": node_raw["pg"][node_mask] - node_raw["pd"][node_mask],
-                "q_spec": -node_raw["qd"][node_mask],
-                "gs": node_raw["gs"][node_mask],
-                "bs": node_raw["bs"][node_mask],
-                "bus_type": node_raw["bus_type"][node_mask],
-                "vm_setpoint": node_raw["vm_setpoint"][node_mask],
-                "n": n_g,
-            })
+            # Filter to forward edges for physics (avoid double-counting)
+            if self.cfg.bidirectional_edges:
+                src_g, dst_g = ei_g
+                fwd = src_g < dst_g
+                ei_phys = ei_g[:, fwd]
+                ea_phys = {k: v[fwd] for k, v in ea_g.items()}
+            else:
+                ei_phys = ei_g
+                ea_phys = ea_g
 
+            sl = lo
+            per_graph.append(
+                {
+                    "edge_index": ei_phys,
+                    "edge_attr_raw": ea_phys,
+                    "p_spec": node_raw["pg"][sl:hi] - node_raw["pd"][sl:hi],
+                    "q_spec": -node_raw["qd"][sl:hi],
+                    "gs": node_raw["gs"][sl:hi],
+                    "bs": node_raw["bs"][sl:hi],
+                    "bus_type": node_raw["bus_type"][sl:hi],
+                    "vm_setpoint": node_raw["vm_setpoint"][sl:hi],
+                    "n": n_g,
+                }
+            )
         return per_graph
 
+    # ------------------------------------------------------------------ #
     def forward(
-        self,
-        data: Batch,
-        run_solver: bool = True,
-    ) -> Dict[str, torch.Tensor]:
-        H = self.encoder(data.x, data.edge_index, data.edge_attr)
-
+        self, data: Batch, run_solver: bool = True
+    ) -> Dict[str, object]:
+        H = self.encoder(data.x, data.edge_index, data.edge_attr, batch=data.batch)
         node_raw = denormalize_node_features(data.x, self.x_mean, self.x_std)
 
-        x_pred = self.state_head(
-            H, node_raw["bus_type"], node_raw["vm_setpoint"],
-        )
-
-        reg_params = self.reg_head(H, data.batch)
+        x_pred = self.state_head(H, node_raw["bus_type"], node_raw["vm_setpoint"])
+        infeas_logits = self.infeasibility_head(H, data.batch)
 
         per_graph = self._extract_per_graph(data, node_raw)
-
-        batch_idx = data.batch
-        unique_graphs = batch_idx.unique()
         total_nodes = data.x.shape[0]
 
-        x_pred_list = []
+        # split batch-level x_pred → per-graph list
+        x_pred_list: List[torch.Tensor] = []
         offset = 0
-        for g_info in per_graph:
-            n_g = g_info["n"]
-            va_g = x_pred[offset:offset + n_g]
-            vm_g = x_pred[total_nodes + offset:total_nodes + offset + n_g]
+        for gi in per_graph:
+            n_g = gi["n"]
+            va_g = x_pred[offset : offset + n_g]
+            vm_g = x_pred[total_nodes + offset : total_nodes + offset + n_g]
             x_pred_list.append(torch.cat([va_g, vm_g]))
             offset += n_g
 
-        if run_solver:
-            if self.solver.use_implicit_diff:
-                x_final_list = []
-                all_residuals = []
-                for i, (g_info, (d_g, u_g, s_g)) in enumerate(
-                    zip(per_graph, reg_params)
-                ):
-                    x_f, res = self.solver.forward_single_graph(
-                        x_pred_list[i], d_g, u_g, s_g,
-                        g_info["edge_index"], g_info["edge_attr_raw"],
-                        g_info["p_spec"], g_info["q_spec"],
-                        g_info["gs"], g_info["bs"],
-                        g_info["bus_type"], g_info["vm_setpoint"],
-                    )
-                    x_final_list.append(x_f)
-                    all_residuals.append(res)
-            else:
-                x_final_list, all_residuals = self.solver.forward_batch(
-                    x_pred_list, reg_params, per_graph,
+        reg_params: list = []
+        final_mu_list: List[float] = []
+
+        if self.cfg.use_adaptive_lm:
+            if run_solver:
+                x_final_list, all_residuals, final_mu_list = (
+                    self.solver.forward_batch_adaptive_lm(x_pred_list, per_graph, self.cfg)
                 )
+            else:
+                x_final_list = x_pred_list
+                all_residuals = [[] for _ in per_graph]
         else:
-            x_final_list = x_pred_list
-            all_residuals = [[] for _ in per_graph]
+            reg_params = self.reg_head(H, data.batch)
+            if run_solver:
+                x_final_list, all_residuals = self.solver.forward_batch_regularised(
+                    x_pred_list, reg_params, per_graph
+                )
+            else:
+                x_final_list = x_pred_list
+                all_residuals = [[] for _ in per_graph]
 
         return {
             "x_pred": x_pred,
@@ -970,10 +977,15 @@ class BifurcationAwarePFSolver(nn.Module):
             "x_final_list": x_final_list,
             "reg_params": reg_params,
             "per_graph": per_graph,
+            "infeasibility_logits": infeas_logits,
             "residuals": all_residuals,
+            "final_mu_list": final_mu_list,
         }
 
 
+# ============================================================================
+# LOSS FUNCTIONS
+# ============================================================================
 def loss_state(
     x_pred: torch.Tensor,
     y_state: torch.Tensor,
@@ -981,62 +993,62 @@ def loss_state(
     batch: torch.Tensor,
     total_nodes: int,
 ) -> torch.Tensor:
-    """L_state = ||x_pred - x*||²  (only on feasible samples).
-
-    x_pred : [2*total_nodes]  packed as [va_all; vm_all]
-    y_state : [total_nodes, 2]  columns are [va, vm]
-    feasible_mask : [B]  bool per graph
-    """
     va_pred = x_pred[:total_nodes]
     vm_pred = x_pred[total_nodes:]
     va_true = y_state[:, 0]
     vm_true = y_state[:, 1]
 
-    unique_graphs = batch.unique()
-    total_loss = torch.tensor(0.0, device=x_pred.device)
-    count = 0
-
-    offset = 0
-    for i, g in enumerate(unique_graphs):
-        n_g = (batch == g).sum().item()
-        if feasible_mask[i]:
-            total_loss = total_loss + (
-                (va_pred[offset:offset + n_g] - va_true[offset:offset + n_g]).pow(2).sum()
-                + (vm_pred[offset:offset + n_g] - vm_true[offset:offset + n_g]).pow(2).sum()
-            )
-            count += 2 * n_g
-        offset += n_g
-
-    if count == 0:
+    node_feasible = feasible_mask[batch]
+    n_feas = node_feasible.sum()
+    if n_feas == 0:
         return torch.tensor(0.0, device=x_pred.device, requires_grad=True)
-    return total_loss / count
+    return (
+        (va_pred - va_true)[node_feasible].pow(2).sum()
+        + (vm_pred - vm_true)[node_feasible].pow(2).sum()
+    ) / (2.0 * n_feas)
 
 
 def loss_physics(
     x_final_list: List[torch.Tensor],
     per_graph: List[Dict[str, torch.Tensor]],
+    feasible_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """L_phys = mean over graphs of ||F(x_T)||²."""
     total = torch.tensor(0.0, device=x_final_list[0].device)
-    for x_f, g_info in zip(x_final_list, per_graph):
+    count = 0
+    for i, (x_f, gi) in enumerate(zip(x_final_list, per_graph)):
+        if not feasible_mask[i]:
+            continue
         F_val = PowerFlowPhysics.compute_mismatch_from_x(
-            x_f, g_info["edge_index"], g_info["edge_attr_raw"],
-            g_info["p_spec"], g_info["q_spec"],
-            g_info["gs"], g_info["bs"],
-            g_info["bus_type"], g_info["vm_setpoint"],
+            x_f,
+            gi["edge_index"],
+            gi["edge_attr_raw"],
+            gi["p_spec"],
+            gi["q_spec"],
+            gi["gs"],
+            gi["bs"],
+            gi["bus_type"],
+            gi["vm_setpoint"],
         )
         total = total + F_val.pow(2).sum()
-    return total / len(x_final_list)
+        count += F_val.shape[0]
+    if count == 0:
+        return torch.tensor(0.0, device=x_final_list[0].device, requires_grad=True)
+    return total / count
 
 
 def loss_regularisation(
     reg_params: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
 ) -> torch.Tensor:
-    """L_reg = mean tr(D) + tr(S)  over graphs."""
     total = torch.tensor(0.0, device=reg_params[0][0].device)
-    for d_g, u_g, s_g in reg_params:
+    for d_g, _u_g, s_g in reg_params:
         total = total + d_g.sum() + s_g.sum()
-    return total / len(reg_params)
+    return total / max(len(reg_params), 1)
+
+
+def loss_infeasibility(
+    logits: torch.Tensor, feasible_mask: torch.Tensor
+) -> torch.Tensor:
+    return F_func.binary_cross_entropy_with_logits(logits, feasible_mask.float())
 
 
 def composite_loss(
@@ -1045,43 +1057,37 @@ def composite_loss(
     cfg: Config,
     stage: int,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute the loss for the current training stage.
-
-    Stage 1: L_state only
-    Stage 2: λ₁ L_state + λ₂ L_phys + λ₃ L_reg
-    """
     total_nodes = data.x.shape[0]
-    feasible = data.feasible_mask  # [B]
+    feasible = data.feasible_mask
 
-    l_s = loss_state(
-        outputs["x_pred"], data.y_state, feasible,
-        data.batch, total_nodes,
-    )
+    l_s = loss_state(outputs["x_pred"], data.y_state, feasible, data.batch, total_nodes)
+    l_i = loss_infeasibility(outputs["infeasibility_logits"], feasible)
 
-    metrics = {"L_state": l_s.item()}
+    metrics: Dict[str, float] = {"L_state": l_s.item(), "L_infeas": l_i.item()}
 
     if stage == 1:
-        return l_s, metrics
+        total = cfg.lambda_1 * l_s + cfg.lambda_infeasibility * l_i
+        metrics["L_total"] = total.item()
+        return total, metrics
 
-    l_p = loss_physics(outputs["x_final_list"], outputs["per_graph"])
-    l_r = loss_regularisation(outputs["reg_params"])
+    l_p = loss_physics(outputs["x_final_list"], outputs["per_graph"], feasible)
+    metrics["L_phys"] = l_p.item()
 
-    total = cfg.lambda_1 * l_s + cfg.lambda_2 * l_p + cfg.lambda_3 * l_r
-    metrics.update({
-        "L_phys": l_p.item(),
-        "L_reg": l_r.item(),
-        "L_total": total.item(),
-    })
+    total = cfg.lambda_1 * l_s + cfg.lambda_2 * l_p + cfg.lambda_infeasibility * l_i
+
+    if not cfg.use_adaptive_lm and outputs.get("reg_params"):
+        l_r = loss_regularisation(outputs["reg_params"])
+        total = total + cfg.lambda_3 * l_r
+        metrics["L_reg"] = l_r.item()
+
+    metrics["L_total"] = total.item()
     return total, metrics
 
 
 # ============================================================================
-# SECTION 10: TRAINER
+# TRAINER
 # ============================================================================
-
 class Trainer:
-    """Two-stage curriculum trainer with wandb logging and local checkpoints."""
-
     def __init__(
         self,
         model: BifurcationAwarePFSolver,
@@ -1097,119 +1103,89 @@ class Trainer:
         self.device = device
 
         self.optimizer = torch.optim.Adam(
-            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
         )
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min",
+            self.optimizer,
+            mode="min",
             factor=cfg.scheduler_factor,
             patience=cfg.scheduler_patience,
         )
-
         self.amp_enabled = cfg.use_amp and device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
-        self.amp_dtype = torch.float16 if self.amp_enabled else None
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
 
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
         setup_file_logging(cfg.log_dir)
 
-        wandb.init(
-            project=cfg.wandb_project,
-            config=asdict(cfg),
-            reinit=True,
-        )
-        wandb.watch(model, log="gradients", log_freq=50)
+        if _WANDB_AVAILABLE:
+            wandb.init(project=cfg.wandb_project, config=asdict(cfg), reinit=True)
+            wandb.watch(model, log="gradients", log_freq=100)
 
         self.cumulative_train_time = 0.0
 
-    # --------------------------------------------------------------------- #
-    #  Helpers                                                                #
-    # --------------------------------------------------------------------- #
+        # per-stage early stopping
+        self.best_val_loss = float("inf")
+        self.best_model_state: Optional[Dict] = None
+        self.es_counter = 0
 
-    def _save_checkpoint(self, epoch: int, stage: int):
-        path = os.path.join(
-            self.cfg.checkpoint_dir, f"epoch_{epoch}_stage{stage}.pt",
+    def _save_checkpoint(self, epoch: int, stage: int, tag: str = ""):
+        name = f"epoch_{epoch}_stage{stage}{tag}.pt"
+        path = os.path.join(self.cfg.checkpoint_dir, name)
+        torch.save(
+            {
+                "epoch": epoch,
+                "stage": stage,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+            },
+            path,
         )
-        torch.save({
-            "epoch": epoch,
-            "stage": stage,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-        }, path)
-        log.info("Checkpoint saved → %s", path)
+        log.info("Checkpoint → %s", path)
 
     @torch.no_grad()
     def _validate(self, stage: int) -> Dict[str, float]:
         self.model.eval()
-        running = {}
+        running: Dict[str, float] = {}
         count = 0
-        val_bar = tqdm(
-            self.val_loader,
-            desc=f"  val (stage {stage})",
-            leave=False,
-            unit="batch",
-        )
-        for data in val_bar:
+        for data in self.val_loader:
             data = data.to(self.device)
             outputs = self.model(data, run_solver=(stage == 2))
             _, metrics = composite_loss(outputs, data, self.cfg, stage)
             for k, v in metrics.items():
                 running[k] = running.get(k, 0.0) + v
             count += 1
-            if "L_state" in running:
-                val_bar.set_postfix(
-                    L_state=f"{running['L_state'] / count:.4f}",
-                )
         return {k: v / max(count, 1) for k, v in running.items()}
 
-    # --------------------------------------------------------------------- #
-    #  Stage runners                                                          #
-    # --------------------------------------------------------------------- #
-
     def _run_stage(self, stage: int, num_epochs: int, epoch_offset: int):
-        solver_tag = "ON" if stage == 2 else "OFF"
         log.info("=" * 60)
-        log.info("STAGE %d  —  %d epochs  (solver %s)", stage, num_epochs, solver_tag)
+        log.info("STAGE %d — %d epochs  (solver %s)", stage, num_epochs,
+                 "ON" if stage == 2 else "OFF")
         log.info("=" * 60)
 
-        epoch_bar = tqdm(
-            range(num_epochs),
-            desc=f"Stage {stage}",
-            unit="epoch",
-            position=0,
-        )
+        self.best_val_loss = float("inf")
+        self.best_model_state = None
+        self.es_counter = 0
 
-        for epoch_local in epoch_bar:
+        for epoch_local in range(num_epochs):
             epoch_global = epoch_offset + epoch_local
             self.model.train()
             epoch_loss = 0.0
             epoch_metrics: Dict[str, float] = {}
             n_batches = 0
+            t0 = time.time()
 
-            t_start = time.time()
-
-            batch_bar = tqdm(
-                self.train_loader,
-                desc=f"  Ep {epoch_global + 1} train",
-                leave=False,
-                unit="batch",
-                position=1,
-            )
-            for data in batch_bar:
+            for data in self.train_loader:
                 data = data.to(self.device)
                 self.optimizer.zero_grad()
 
-                with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+                with torch.amp.autocast("cuda", enabled=self.amp_enabled):
                     outputs = self.model(data, run_solver=(stage == 2))
-                    loss, metrics = composite_loss(
-                        outputs, data, self.cfg, stage,
-                    )
+                    loss, metrics = composite_loss(outputs, data, self.cfg, stage)
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.cfg.grad_clip,
-                )
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
@@ -1218,116 +1194,91 @@ class Trainer:
                     epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v
                 n_batches += 1
 
-                batch_bar.set_postfix(loss=f"{loss.item():.4f}")
-
-            t_epoch = time.time() - t_start
+            t_epoch = time.time() - t0
             self.cumulative_train_time += t_epoch
-
             avg_loss = epoch_loss / max(n_batches, 1)
-            avg_metrics = {k: v / max(n_batches, 1)
-                           for k, v in epoch_metrics.items()}
+            avg_metrics = {k: v / max(n_batches, 1) for k, v in epoch_metrics.items()}
 
             self.scheduler.step(avg_loss)
 
             val_metrics = self._validate(stage)
+            val_total = val_metrics.get("L_total", val_metrics.get("L_state", float("inf")))
+
+            # early stopping
+            if val_total < self.best_val_loss:
+                self.best_val_loss = val_total
+                self.best_model_state = {
+                    k: v.clone() for k, v in self.model.state_dict().items()
+                }
+                self.es_counter = 0
+            else:
+                self.es_counter += 1
 
             log_dict = {
                 "stage": stage,
                 "epoch": epoch_global,
                 "train/loss": avg_loss,
                 "train/time_s": t_epoch,
-                "train/cumulative_time_s": self.cumulative_train_time,
                 "lr": self.optimizer.param_groups[0]["lr"],
             }
             for k, v in avg_metrics.items():
                 log_dict[f"train/{k}"] = v
             for k, v in val_metrics.items():
                 log_dict[f"val/{k}"] = v
-
-            wandb.log(log_dict, step=epoch_global)
+            if _WANDB_AVAILABLE and wandb.run is not None:
+                wandb.log(log_dict, step=epoch_global)
 
             summary = (
-                f"loss={avg_loss:.5f}  "
-                f"val_state={val_metrics.get('L_state', 0.0):.5f}  "
-                f"time={t_epoch:.1f}s  "
-                f"lr={self.optimizer.param_groups[0]['lr']:.2e}"
+                f"loss={avg_loss:.5f}  val={val_total:.5f}  "
+                f"t={t_epoch:.1f}s  lr={self.optimizer.param_groups[0]['lr']:.2e}  "
+                f"es={self.es_counter}/{self.cfg.early_stop_patience}"
             )
-            epoch_bar.set_postfix_str(summary)
-            log.info(
-                "Epoch %d/%d (stage %d)  %s",
-                epoch_global + 1,
-                epoch_offset + num_epochs,
-                stage,
-                summary,
-            )
+            log.info("Ep %d (stage %d)  %s", epoch_global + 1, stage, summary)
 
-            if (epoch_global + 1) % 5 == 0:
+            if (epoch_global + 1) % 10 == 0:
                 self._save_checkpoint(epoch_global + 1, stage)
 
-        epoch_bar.close()
+            if self.es_counter >= self.cfg.early_stop_patience:
+                log.info("Early stopping triggered at epoch %d", epoch_global + 1)
+                break
 
-    # --------------------------------------------------------------------- #
-    #  Main entry                                                             #
-    # --------------------------------------------------------------------- #
+        # restore best
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+            log.info("Restored best model (val_loss=%.6f)", self.best_val_loss)
 
     def train(self, stages: str = "both"):
-        """Run training for the requested stage(s).
+        t_total = time.time()
+        run_s1 = stages in ("1", "both")
+        run_s2 = stages in ("2", "both")
 
-        Args:
-            stages: ``"1"`` for pre-training only, ``"2"`` for end-to-end
-                    unrolling only, or ``"both"`` (default) for the full
-                    two-stage curriculum.
-        """
-        total_start = time.time()
-        run_stage1 = stages in ("1", "both")
-        run_stage2 = stages in ("2", "both")
+        if run_s1:
+            self._run_stage(1, self.cfg.epochs_stage1, 0)
+            self._save_checkpoint(self.cfg.epochs_stage1, 1, tag="_final")
 
-        if run_stage1:
-            self._run_stage(stage=1, num_epochs=self.cfg.epochs_stage1,
-                            epoch_offset=0)
-            stage1_path = os.path.join(
-                self.cfg.checkpoint_dir, "stage1_final.pt",
-            )
-            torch.save({
-                "stage": 1,
-                "epoch": self.cfg.epochs_stage1,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
-            }, stage1_path)
-            log.info("Stage 1 model saved → %s", stage1_path)
+        if run_s2:
+            offset = self.cfg.epochs_stage1 if run_s1 else 0
+            self._run_stage(2, self.cfg.epochs_stage2, offset)
 
-        if run_stage2:
-            epoch_offset = self.cfg.epochs_stage1 if run_stage1 else 0
-            self._run_stage(stage=2, num_epochs=self.cfg.epochs_stage2,
-                            epoch_offset=epoch_offset)
+        total_time = time.time() - t_total
+        log.info("Training complete in %.1fs", total_time)
 
-        total_time = time.time() - total_start
-        log.info("Training complete in %.1f s", total_time)
-        wandb.log({"total_training_time_s": total_time})
-
-        tag = f"stage{stages}" if stages != "both" else "final"
-        final_path = os.path.join(self.cfg.checkpoint_dir, f"{tag}_model.pt")
+        final_path = os.path.join(self.cfg.checkpoint_dir, "final_model.pt")
         torch.save(self.model.state_dict(), final_path)
-        log.info("Final model saved → %s", final_path)
+        log.info("Final model → %s", final_path)
 
 
 # ============================================================================
-# SECTION 11: INFERENCE PIPELINE
+# INFERENCE
 # ============================================================================
-
 class InferenceEngine:
-    """Run inference with convergence checking and infeasibility detection."""
-
     def __init__(self, cfg: Config, device: torch.device):
         self.cfg = cfg
         self.device = device
 
     @torch.no_grad()
     def run(
-        self,
-        model: BifurcationAwarePFSolver,
-        dataloader: DataLoader,
+        self, model: BifurcationAwarePFSolver, dataloader: DataLoader
     ) -> Dict[str, float]:
         model.eval()
         orig_T = model.solver.T
@@ -1337,102 +1288,100 @@ class InferenceEngine:
         all_pred_infeasible: List[bool] = []
         all_true_feasible: List[bool] = []
         total_samples = 0
-        total_inference_time = 0.0
+        total_time = 0.0
 
-        infer_bar = tqdm(
-            dataloader,
-            desc="Inference",
-            unit="batch",
-        )
-        for data in infer_bar:
+        for data in tqdm(dataloader, desc="Inference", unit="batch"):
             data = data.to(self.device)
-            batch_size_g = data.batch.unique().shape[0]
-            total_samples += batch_size_g
+            B_g = data.batch.unique().shape[0]
+            total_samples += B_g
 
             t0 = time.time()
             outputs = model(data, run_solver=True)
-            batch_time = time.time() - t0
-            total_inference_time += batch_time
+            total_time += time.time() - t0
 
-            infer_bar.set_postfix(
-                samples=total_samples,
-                ms_per_sample=f"{1000 * batch_time / max(batch_size_g, 1):.1f}",
-            )
+            infeas_logits = outputs["infeasibility_logits"]
 
-            for i, (x_f, g_info, (d_g, u_g, s_g)) in enumerate(
-                zip(
-                    outputs["x_final_list"],
-                    outputs["per_graph"],
-                    outputs["reg_params"],
-                )
+            for i, (x_f, gi) in enumerate(
+                zip(outputs["x_final_list"], outputs["per_graph"])
             ):
                 F_final = PowerFlowPhysics.compute_mismatch_from_x(
                     x_f,
-                    g_info["edge_index"], g_info["edge_attr_raw"],
-                    g_info["p_spec"], g_info["q_spec"],
-                    g_info["gs"], g_info["bs"],
-                    g_info["bus_type"], g_info["vm_setpoint"],
+                    gi["edge_index"],
+                    gi["edge_attr_raw"],
+                    gi["p_spec"],
+                    gi["q_spec"],
+                    gi["gs"],
+                    gi["bs"],
+                    gi["bus_type"],
+                    gi["vm_setpoint"],
                 )
-                residual_inf = F_final.abs().max().item()
-                converged = residual_inf < self.cfg.epsilon
-
-                trace_lambda = d_g.sum().item() + s_g.sum().item()
+                res_inf = F_final.abs().max().item()
+                converged = res_inf < self.cfg.epsilon
 
                 residuals = outputs["residuals"][i]
                 stagnated = False
                 if len(residuals) >= 2:
-                    delta_r = abs(residuals[-1] - residuals[-2])
-                    stagnated = delta_r < self.cfg.stagnation_tol
+                    stagnated = abs(residuals[-1] - residuals[-2]) < self.cfg.stagnation_tol
 
-                pred_infeasible = (
-                    (not converged)
-                    and stagnated
-                    and (trace_lambda > self.cfg.tau)
-                )
+                # learned classifier signal
+                pred_infeas_learned = infeas_logits[i].item() < 0.0
+
+                # heuristic signal
+                if self.cfg.use_adaptive_lm:
+                    mu_f = (
+                        outputs["final_mu_list"][i]
+                        if i < len(outputs.get("final_mu_list", []))
+                        else self.cfg.mu_init
+                    )
+                    heuristic_flag = (not converged) and stagnated and (mu_f > self.cfg.tau)
+                elif outputs.get("reg_params"):
+                    d_g, _, s_g = outputs["reg_params"][i]
+                    tr_lam = d_g.sum().item() + s_g.sum().item()
+                    heuristic_flag = (not converged) and stagnated and (tr_lam > self.cfg.tau)
+                else:
+                    heuristic_flag = (not converged) and stagnated
+
+                pred_infeasible = pred_infeas_learned or heuristic_flag
 
                 all_converged.append(converged)
                 all_pred_infeasible.append(pred_infeasible)
-                all_true_feasible.append(data.feasible_mask[i].item())
+                all_true_feasible.append(bool(data.feasible_mask[i].item()))
 
-        convergence_rate = sum(all_converged) / max(total_samples, 1)
-
+        conv_rate = sum(all_converged) / max(total_samples, 1)
         true_infeasible = [not f for f in all_true_feasible]
         tp = sum(p and t for p, t in zip(all_pred_infeasible, true_infeasible))
         fp = sum(p and (not t) for p, t in zip(all_pred_infeasible, true_infeasible))
         fn = sum((not p) and t for p, t in zip(all_pred_infeasible, true_infeasible))
-
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
-
-        per_sample_time = total_inference_time / max(total_samples, 1)
+        prec = tp / max(tp + fp, 1)
+        rec = tp / max(tp + fn, 1)
+        f1 = 2 * prec * rec / max(prec + rec, 1e-12)
+        per_sample = total_time / max(total_samples, 1)
 
         metrics = {
-            "inference/total_time_s": total_inference_time,
-            "inference/per_sample_time_s": per_sample_time,
-            "inference/convergence_rate": convergence_rate,
-            "inference/infeasibility_precision": precision,
-            "inference/infeasibility_recall": recall,
+            "inference/total_time_s": total_time,
+            "inference/per_sample_time_s": per_sample,
+            "inference/convergence_rate": conv_rate,
+            "inference/infeasibility_precision": prec,
+            "inference/infeasibility_recall": rec,
             "inference/infeasibility_f1": f1,
             "inference/total_samples": total_samples,
         }
-
-        if wandb.run is not None:
+        if _WANDB_AVAILABLE and wandb.run is not None:
             wandb.log(metrics)
-        log.info("Inference complete: %d samples in %.2fs (%.4fs/sample)",
-                 total_samples, total_inference_time, per_sample_time)
-        log.info("Convergence rate: %.3f", convergence_rate)
-        log.info("Infeasibility — P: %.3f  R: %.3f  F1: %.3f",
-                 precision, recall, f1)
+
+        log.info(
+            "Inference: %d samples  %.2fs (%.4fs/sample)  conv=%.3f  "
+            "infeas P/R/F1=%.3f/%.3f/%.3f",
+            total_samples, total_time, per_sample, conv_rate, prec, rec, f1,
+        )
 
         model.solver.T = orig_T
         return metrics
 
 
 # ============================================================================
-# SECTION 12: MAIN ENTRY POINT
+# MAIN
 # ============================================================================
-
 def seed_everything(seed: int):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -1441,9 +1390,7 @@ def seed_everything(seed: int):
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Train / evaluate the Bifurcation-Aware PF Solver.",
-    )
+    p = argparse.ArgumentParser(description="Bifurcation-Aware PF Solver")
     p.add_argument("--data-dir", default="data/processed/task4_solvability")
     p.add_argument("--checkpoint-dir", default="checkpoints")
     p.add_argument("--log-dir", default="logs")
@@ -1452,12 +1399,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--num-mp-layers", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--no-global-attention", action="store_true")
+    p.add_argument("--num-attention-heads", type=int, default=4)
     p.add_argument("--rank-k", type=int, default=8)
 
-    p.add_argument("--T", type=int, default=5, help="Unroll steps")
+    p.add_argument("--T", type=int, default=5)
     p.add_argument("--epsilon", type=float, default=1e-7)
     p.add_argument("--max-iter-inference", type=int, default=20)
-    p.add_argument("--use-implicit-diff", action="store_true")
+
+    p.add_argument("--adaptive-lm", action="store_true")
+    p.add_argument("--mu-init", type=float, default=1e-3)
+    p.add_argument("--mu-min", type=float, default=1e-8)
+    p.add_argument("--mu-max", type=float, default=1e6)
+    p.add_argument("--mu-decrease", type=float, default=0.5)
+    p.add_argument("--mu-increase", type=float, default=2.0)
 
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
@@ -1467,24 +1422,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-1", type=float, default=1.0)
     p.add_argument("--lambda-2", type=float, default=1.0)
     p.add_argument("--lambda-3", type=float, default=1e-3)
+    p.add_argument("--lambda-infeasibility", type=float, default=1.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--early-stop-patience", type=int, default=25)
 
     p.add_argument("--tau", type=float, default=50.0)
     p.add_argument("--stagnation-tol", type=float, default=1e-6)
+    p.add_argument("--vm-min", type=float, default=0.5)
+    p.add_argument("--vm-max", type=float, default=1.5)
 
-    p.add_argument("--amp", action="store_true",
-                   help="Enable mixed-precision (AMP) training on CUDA.")
+    p.add_argument("--unidirectional-edges", action="store_true",
+                   help="Set if each branch is stored as ONE directed edge.")
+    p.add_argument("--amp", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
 
-    p.add_argument("--stage", choices=["1", "2", "both"], default="both",
-                   help="Which training stage(s) to run: '1', '2', or 'both'.")
-    p.add_argument("--resume-from", default=None,
-                   help="Path to checkpoint to load before training "
-                        "(required when --stage 2 to supply stage-1 weights).")
-    p.add_argument("--eval-only", default=None,
-                   help="Path to checkpoint for evaluation only.")
-
+    p.add_argument("--stage", choices=["1", "2", "both"], default="both")
+    p.add_argument("--resume-from", default=None)
+    p.add_argument("--eval-only", default=None)
     return p
 
 
@@ -1500,11 +1455,18 @@ def main():
         hidden_dim=args.hidden_dim,
         num_mp_layers=args.num_mp_layers,
         dropout=args.dropout,
+        use_global_attention=not args.no_global_attention,
+        num_attention_heads=args.num_attention_heads,
         rank_k=args.rank_k,
         T=args.T,
         epsilon=args.epsilon,
         max_iter_inference=args.max_iter_inference,
-        use_implicit_diff=args.use_implicit_diff,
+        use_adaptive_lm=args.adaptive_lm,
+        mu_init=args.mu_init,
+        mu_min=args.mu_min,
+        mu_max=args.mu_max,
+        mu_decrease=args.mu_decrease,
+        mu_increase=args.mu_increase,
         lr=args.lr,
         weight_decay=args.weight_decay,
         batch_size=args.batch_size,
@@ -1513,24 +1475,25 @@ def main():
         lambda_1=args.lambda_1,
         lambda_2=args.lambda_2,
         lambda_3=args.lambda_3,
+        lambda_infeasibility=args.lambda_infeasibility,
         grad_clip=args.grad_clip,
+        early_stop_patience=args.early_stop_patience,
         tau=args.tau,
         stagnation_tol=args.stagnation_tol,
+        vm_min=args.vm_min,
+        vm_max=args.vm_max,
+        bidirectional_edges=not args.unidirectional_edges,
         use_amp=args.amp,
         seed=args.seed,
     )
 
     seed_everything(cfg.seed)
-
-    if args.cpu or not torch.cuda.is_available():
-        device = torch.device("cpu")
-    else:
-        device = torch.device("cuda")
+    device = torch.device("cpu") if (args.cpu or not torch.cuda.is_available()) else torch.device("cuda")
     log.info("Device: %s", device)
 
     train_loader, val_loader, test_loader, norm_stats = load_datasets(cfg)
     log.info(
-        "Data loaded — train: %d  val: %d  test: %d",
+        "Data — train: %d  val: %d  test: %d",
         len(train_loader.dataset),
         len(val_loader.dataset),
         len(test_loader.dataset),
@@ -1538,47 +1501,47 @@ def main():
 
     model = BifurcationAwarePFSolver(cfg, norm_stats)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info("Model parameters: %d", n_params)
+    log.info("Parameters: %d  |  adaptive_lm=%s  global_attn=%s  bidir_edges=%s",
+             n_params, cfg.use_adaptive_lm, cfg.use_global_attention, cfg.bidirectional_edges)
 
-    def _load_checkpoint(path: str):
+    def _load_ckpt(path: str):
         state = torch.load(path, map_location="cpu", weights_only=False)
-        if "model_state_dict" in state:
-            model.load_state_dict(state["model_state_dict"])
-            log.info("Loaded model weights from checkpoint (dict) → %s", path)
-        else:
-            model.load_state_dict(state)
-            log.info("Loaded model weights from checkpoint (raw) → %s", path)
+        sd = state.get("model_state_dict", state)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing:
+            log.info("Missing keys: %s", missing)
+        if unexpected:
+            log.info("Unexpected keys: %s", unexpected)
+        log.info("Loaded checkpoint ← %s", path)
 
     if args.eval_only:
         setup_file_logging(cfg.log_dir)
-        _load_checkpoint(args.eval_only)
+        _load_ckpt(args.eval_only)
         model = model.to(device)
-        wandb.init(project=cfg.wandb_project, config=asdict(cfg), reinit=True)
+        if _WANDB_AVAILABLE:
+            wandb.init(project=cfg.wandb_project, config=asdict(cfg), reinit=True)
         engine = InferenceEngine(cfg, device)
         engine.run(model, test_loader)
-        wandb.finish()
+        if _WANDB_AVAILABLE:
+            wandb.finish()
         return
 
     if args.resume_from:
-        _load_checkpoint(args.resume_from)
-
-    if args.stage == "2" and args.resume_from is None:
-        log.warning(
-            "Running stage 2 without --resume-from; model starts from "
-            "random init (use --resume-from to load stage-1 weights)."
-        )
+        _load_ckpt(args.resume_from)
+    elif args.stage == "2":
+        log.warning("Stage 2 without --resume-from: starting from random init.")
 
     model = model.to(device)
     trainer = Trainer(model, train_loader, val_loader, cfg, device)
     trainer.train(stages=args.stage)
 
-    log.info("Running inference on test set...")
+    log.info("Running test inference …")
     engine = InferenceEngine(cfg, device)
     engine.run(model, test_loader)
 
-    wandb.finish()
+    if _WANDB_AVAILABLE:
+        wandb.finish()
     log.info("Done.")
-
 
 if __name__ == "__main__":
     main()
