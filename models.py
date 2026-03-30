@@ -2063,3 +2063,136 @@ def _cfg_from_args(args) -> Config:
         epochs_stage2=args.epochs_stage2,
         lambda_1=args.lambda_1,
         lambda_2=args.lambda_2,
+        lambda_3=args.lambda_3,
+        lambda_infeasibility=args.lambda_infeasibility,
+        grad_clip=args.grad_clip,
+        early_stop_patience=args.early_stop_patience,
+        scheduler_patience=args.scheduler_patience,
+        scheduler_factor=args.scheduler_factor,
+        tau=args.tau,
+        stagnation_tol=args.stagnation_tol,
+        vm_min=args.vm_min,
+        vm_max=args.vm_max,
+        bidirectional_edges=not args.unidirectional_edges,
+        use_amp=args.amp,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    cfg = _cfg_from_args(args)
+
+    seed_everything(cfg.seed)
+    device = (
+        torch.device("cpu")
+        if (args.cpu or not torch.cuda.is_available())
+        else torch.device("cuda")
+    )
+    log.info("Device: %s", device)
+
+    # ── grid search mode ──
+    if args.grid_search:
+        sweep_spec = _parse_sweep_spec(args)
+        experiments = build_experiment_grid(sweep_spec)
+        log.info(
+            "Grid search: %d experiments  (%d axes: %s)",
+            len(experiments),
+            len(sweep_spec),
+            ", ".join(sweep_spec.keys()),
+        )
+
+        if args.grid_list:
+            for i, exp in enumerate(experiments):
+                print(f"  [{i:4d}]  {exp}")
+            print(f"\nTotal: {len(experiments)} experiments")
+            return
+
+        exp_ids: Optional[List[int]] = None
+        if args.grid_id is not None:
+            exp_ids = args.grid_id
+        elif args.grid_range is not None:
+            exp_ids = list(range(args.grid_range[0], args.grid_range[1]))
+        # else: None → run all
+
+        runner = GridSearchRunner(
+            base_cfg=cfg,
+            experiments=experiments,
+            device=device,
+            results_dir=args.grid_results_dir,
+            stages=args.stage,
+        )
+        runner.run(experiment_ids=exp_ids)
+        if _WANDB_AVAILABLE and wandb.run is not None:
+            wandb.finish()
+        return
+
+    # ── single-run mode ──
+    train_loader, val_loader, test_loader, norm_stats = load_datasets(cfg)
+    log.info(
+        "Data — train: %d  val: %d  test: %d",
+        len(train_loader.dataset),
+        len(val_loader.dataset),
+        len(test_loader.dataset),
+    )
+
+    model = BifurcationAwarePFSolver(cfg, norm_stats)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(
+        "Parameters: %d  |  adaptive_lm=%s  global_attn=%s  bidir_edges=%s",
+        n_params,
+        cfg.use_adaptive_lm,
+        cfg.use_global_attention,
+        cfg.bidirectional_edges,
+    )
+
+    def _load_ckpt(path: str):
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        sd = state.get("model_state_dict", state)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing:
+            log.info("Missing keys: %s", missing)
+        if unexpected:
+            log.info("Unexpected keys: %s", unexpected)
+        log.info("Loaded checkpoint ← %s", path)
+
+    if args.eval_only:
+        run_sig = generate_run_signature(cfg)
+        setup_file_logging(cfg.log_dir, prefix=f"eval_{run_sig}")
+        _load_ckpt(args.eval_only)
+        model = model.to(device)
+        if _WANDB_AVAILABLE:
+            wandb.init(
+                project=cfg.wandb_project, config=asdict(cfg), reinit=True
+            )
+        engine = InferenceEngine(cfg, device)
+        engine.run(model, test_loader)
+        if _WANDB_AVAILABLE:
+            wandb.finish()
+        return
+
+    if args.resume_from:
+        _load_ckpt(args.resume_from)
+    elif args.stage == "2":
+        log.warning(
+            "Stage 2 without --resume-from: starting from random init."
+        )
+
+    model = model.to(device)
+    trainer = Trainer(model, train_loader, val_loader, cfg, device)
+    trainer.train(stages=args.stage)
+
+    log.info("Running test inference …")
+    engine = InferenceEngine(cfg, device)
+    engine.run(model, test_loader)
+
+    if _WANDB_AVAILABLE:
+        wandb.finish()
+    log.info("Done.")
+
+
+if __name__ == "__main__":
+    main()
