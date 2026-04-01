@@ -1,0 +1,19 @@
+{
+  "exp_id": 10,
+  "run_sig": "hd64_lr0.001_T3_b7e68b",
+  "overrides": {
+    "T": "3",
+    "dropout": "0.1",
+    "hidden_dim": "64",
+    "lr": "0.001",
+    "num_mp_layers": "2"
+  },
+  "best_val_loss": 0.0011015298304807445,
+  "inference/total_time_s": 337.428813457489,
+  "inference/per_sample_time_s": 0.007076946590970827,
+  "inference/convergence_rate": 0.0,
+  "inference/infeasibility_precision": 1.0,
+  "inference/infeasibility_recall": 0.9999578929639142,
+  "inference/infeasibility_f1": 0.9999789460386972,
+  "inference/total_samples": 47680
+}
