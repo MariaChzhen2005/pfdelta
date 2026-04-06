@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────
 # run_all_experiments.sh — Launch all experiments for the bifurcation-aware
 # power-flow solver.
 #
@@ -12,7 +12,7 @@
 #   1. conda activate pfdelta
 #   2. python data_generation.py                     # regenerate dataset with new fields
 #   3. python data_generation.py --generate-n3       # generate N-3 test set
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,9 +27,10 @@ WANDB_PROJECT="pfdelta-bifurcation"
 # Common flags shared by all training runs
 COMMON="--data-dir ${DATA_DIR} --checkpoint-dir ${CKPT_DIR} --log-dir ${LOG_DIR} \
 --wandb-project ${WANDB_PROJECT} --hidden-dim 64 --num-mp-layers 4 --lr 1e-3 \
---batch-size 32 --epochs-stage1 200 --epochs-stage2 50 --seed 42 --amp"
+--batch-size 128 --epochs-stage1 80 --epochs-stage2 20 --early-stop-patience 15 \
+--seed 42 --amp"
 
-# ─── Parse optional --gpus flag ──────────────────────────────────────────────
+# ─── Parse optional --gpus flag ─────────────────
 GPUS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,7 +43,13 @@ IFS=',' read -ra GPU_LIST <<< "${GPUS:-0}"
 N_GPUS=${#GPU_LIST[@]}
 echo "Using ${N_GPUS} GPU(s): ${GPU_LIST[*]}"
 
-# ─── Helper: run a training job ──────────────────────────────────────────────
+# ─── Helper: compute run signature via Python ───
+get_sig() {
+  # Pass the same flags that will be used for training to get the deterministic signature
+  python models.py $COMMON "$@" --print-signature --cpu 2>/dev/null
+}
+
+# ─── Helper: run a training job ─────────────────
 GPU_IDX=0
 PIDS=()
 
@@ -117,19 +124,36 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  Pre-compute run signatures so Phase 2 can find the right checkpoints
+# ═════════════════════════════════════════════════════════════════════════════
+echo "============================================================"
+echo " Computing run signatures ..."
+echo "============================================================"
+
+SIG_E1=$(get_sig --adaptive-lm --T 5 --stage both)
+SIG_E3=$(get_sig --adaptive-lm --T 5 --stage both --train-contingency-max 1)
+SIG_E5B=$(get_sig --adaptive-lm --T 5 --stage both --train-contingency-max 1 --edge-dropout 0.05)
+SIG_VANILLA=$(get_sig --adaptive-lm --T 5 --lambda-infeasibility 0)
+
+echo "  E1  (adaptive LM, full data):  ${SIG_E1}"
+echo "  E3  (adaptive LM, n+n-1):     ${SIG_E3}"
+echo "  E5B (adaptive LM, n+n-1, dropout): ${SIG_E5B}"
+echo "  VANILLA (pure GNN regression): ${SIG_VANILLA}"
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  PHASE 1: Training runs (parallelised across GPUs)
 # ═════════════════════════════════════════════════════════════════════════════
 echo "============================================================"
 echo " PHASE 1: Training (4 runs)"
 echo "============================================================"
 
-# E1 — Baseline, adaptive LM, full data, both stages
+# E1 — Full model: adaptive LM, full data, both stages
 run_train "E1_baseline_adaptive_lm" \
   --adaptive-lm --T 5 --stage both
 
-# E8B — Baseline, regularised solver, full data, both stages
-run_train "E8B_baseline_regularised" \
-  --T 5 --stage both
+# B_VANILLA — Pure GNN regression (stage 1 only, no infeasibility loss)
+run_train "B_VANILLA_GNN" \
+  --adaptive-lm --T 5 --stage 1 --lambda-infeasibility 0
 
 # E3 — N+N-1 only, adaptive LM (for transfer tests)
 run_train "E3_n01_adaptive_lm" \
@@ -144,84 +168,213 @@ run_train "E5B_n01_dropout005" \
 wait_all
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 2: Evaluation-only runs (use trained checkpoints)
+#  Locate checkpoints by signature
+# ═════════════════════════════════════════════════════════════════════════════
+CKPT_E1="${CKPT_DIR}/final_model_${SIG_E1}.pt"
+CKPT_E3="${CKPT_DIR}/final_model_${SIG_E3}.pt"
+CKPT_E5B="${CKPT_DIR}/final_model_${SIG_E5B}.pt"
+CKPT_VANILLA="${CKPT_DIR}/final_model_${SIG_VANILLA}.pt"
+# Stage-1-only checkpoint from E1 (for concern 2: clean GNN-only baseline)
+CKPT_E1_S1="${CKPT_DIR}/epoch_80_stage1_final_${SIG_E1}.pt"
+
+for name_ckpt in "E1:${CKPT_E1}" "E1_S1:${CKPT_E1_S1}" "E3:${CKPT_E3}" "E5B:${CKPT_E5B}" "VANILLA:${CKPT_VANILLA}"; do
+  name="${name_ckpt%%:*}"
+  ckpt="${name_ckpt#*:}"
+  if [[ -f "$ckpt" ]]; then
+    echo "  ${name} checkpoint found: ${ckpt}"
+  else
+    echo "  WARNING: ${name} checkpoint NOT found: ${ckpt}"
+  fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 2: Evaluation-only runs
 # ═════════════════════════════════════════════════════════════════════════════
 echo "============================================================"
-echo " PHASE 2: Evaluation (7 runs)"
+echo " PHASE 2: Evaluation"
 echo "============================================================"
 
-# Find the final checkpoints produced by Phase 1.
-# the trainer saves epoch_<N>_stage2_final_<sig>.pt
-find_ckpt() {
-  local pattern="$1"
-  local ckpt
-  ckpt=$(ls -t ${CKPT_DIR}/${pattern} 2>/dev/null | head -1)
-  if [[ -z "$ckpt" ]]; then
-    echo "ERROR: No checkpoint matching '${pattern}' in ${CKPT_DIR}/" >&2
-    return 1
-  fi
-  echo "$ckpt"
-}
+# ─── Concern 1: Baselines for external comparison ────────────────────────────
+echo "--- Concern 1: Baselines ---"
 
-CKPT_E1=$(find_ckpt "*stage2*final*.pt" | head -1)    # first match for E1
-CKPT_E3=$(find_ckpt "*n01_adaptive*.pt" || true)
-CKPT_E5B=$(find_ckpt "*dropout005*.pt" || true)
-CKPT_E8B=$(find_ckpt "*regularised*.pt" || true)
+# B_FLAT_T5:  Flat-start LM baseline at T=5  (same budget as model)
+run_train "B_FLAT_T5" \
+  --adaptive-lm --T 5 --max-iter-inference 5 --baseline flat-start
 
-# Fallback: if naming doesn't work, try the generic final checkpoint
-if [[ -z "$CKPT_E1" ]]; then
-  echo "WARNING: Could not auto-detect E1 checkpoint. Trying final_model_*.pt ..."
-  CKPT_E1=$(find_ckpt "final_model_*.pt")
+# B_FLAT_T20: Flat-start LM baseline at T=20 (generous budget)
+run_train "B_FLAT_T20" \
+  --adaptive-lm --T 5 --max-iter-inference 20 --baseline flat-start
+
+# B_FLAT_T50: Flat-start LM baseline at T=50 (very generous)
+run_train "B_FLAT_T50" \
+  --adaptive-lm --T 5 --max-iter-inference 50 --baseline flat-start
+
+wait_all
+
+# ─── Concern 2: Clean stage-1-only GNN baseline 
+echo "--- Concern 2: GNN-only baselines ---"
+
+# B_VANILLA_T0: Pure GNN regression (no infeas head, no solver)
+if [[ -f "$CKPT_VANILLA" ]]; then
+  run_eval "B_VANILLA_T0_baseline" "$CKPT_VANILLA" \
+    --adaptive-lm --T 5 --max-iter-inference 0 --lambda-infeasibility 0
 fi
 
-echo "E1  checkpoint: $CKPT_E1"
-echo "E3  checkpoint: ${CKPT_E3:-NOT FOUND}"
-echo "E5B checkpoint: ${CKPT_E5B:-NOT FOUND}"
-echo "E8B checkpoint: ${CKPT_E8B:-NOT FOUND}"
+# E_S1_T0:  Stage-1-only checkpoint, no solver (raw GNN quality)
+if [[ -f "$CKPT_E1_S1" ]]; then
+  run_eval "E_S1_T0_gnn_direct" "$CKPT_E1_S1" \
+    --adaptive-lm --T 5 --max-iter-inference 0
 
-# --- E2: Per-κ-bin breakdown (uses E1 checkpoint, default test set) ---
+  # E_S1_T5:  Stage-1-only checkpoint, T=5 solver at inference
+  run_eval "E_S1_T5_plus_solver" "$CKPT_E1_S1" \
+    --adaptive-lm --T 5 --max-iter-inference 5
+
+  # E_S1_T10: Stage-1-only checkpoint, T=10 solver
+  run_eval "E_S1_T10_plus_solver" "$CKPT_E1_S1" \
+    --adaptive-lm --T 5 --max-iter-inference 10
+fi
+
+wait_all
+
+# ─── Goal 1: Accurate state estimation ──────────
+echo "--- Goal 1: Accurate state estimation ---"
+
+# E2: Per-κ-bin breakdown (E1 checkpoint, default test set)
 run_eval "E2_per_bin_breakdown" "$CKPT_E1" \
   --adaptive-lm --T 5
 
-# --- E3_eval: N-1→N-2 transfer (trained on n+n-1, test on n-2 only) ---
-if [[ -n "$CKPT_E3" ]]; then
+# E7_T0: GNN-only baseline — no solver iterations (warm-start quality)
+run_eval "E7_T0_gnn_only" "$CKPT_E1" \
+  --adaptive-lm --T 5 --max-iter-inference 0
+
+# E7_T1/T5/T10/T20: Iteration-vs-accuracy sweep (concern 8: wall-clock)
+run_eval "E7_T1_iters" "$CKPT_E1" \
+  --adaptive-lm --T 5 --max-iter-inference 1
+
+run_eval "E7_T5_iters" "$CKPT_E1" \
+  --adaptive-lm --T 5 --max-iter-inference 5
+
+run_eval "E7_T10_iters" "$CKPT_E1" \
+  --adaptive-lm --T 5 --max-iter-inference 10
+
+wait_all
+
+# ─── Concern 4: Per-contingency-order stratified eval on E1 ─────────────────
+echo "--- Concern 4: E1 per-contingency stratified ---"
+
+# E1_N0: E1 evaluated on N-only (base topology) test slice
+run_eval "E1_N0_base" "$CKPT_E1" \
+  --adaptive-lm --T 5 --test-contingency-filter 0
+
+# E1_N1: E1 evaluated on N-1 test slice
+run_eval "E1_N1_contingency" "$CKPT_E1" \
+  --adaptive-lm --T 5 --test-contingency-filter 1
+
+# E1_N2: E1 evaluated on N-2 test slice (concern 3: fills the gap)
+run_eval "E1_N2_contingency" "$CKPT_E1" \
+  --adaptive-lm --T 5 --test-contingency-filter 2
+
+wait_all
+
+# ─── Goal 2: Reliable feasible/infeasible near the boundary ──────────────────
+echo "--- Goal 2: Infeasibility detection ---"
+
+# E6A: Infeasibility ablation — learned head only
+run_eval "E6A_infeas_learned_only" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode learned_only
+
+# E6B: Infeasibility ablation — heuristic only (mu-based)
+run_eval "E6B_infeas_heuristic_only" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only
+
+# E6C skipped — combined mode is the default, identical to E2
+
+wait_all
+
+# ─── Must-have 1: Per-contingency-order calibration (ECE/AUROC per slice) ────
+echo "--- Must-have 1: Per-contingency infeasibility calibration ---"
+
+# E6A learned-only, stratified by contingency order
+run_eval "E6A_learned_N0" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --test-contingency-filter 0
+
+run_eval "E6A_learned_N1" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --test-contingency-filter 1
+
+run_eval "E6A_learned_N2" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --test-contingency-filter 2
+
+run_eval "E6A_learned_N3" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --test-data-dir "$N3_DIR" --test-contingency-filter 3
+
+wait_all
+
+# E6B heuristic-only, stratified by contingency order
+run_eval "E6B_heuristic_N0" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --test-contingency-filter 0
+
+run_eval "E6B_heuristic_N1" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --test-contingency-filter 1
+
+run_eval "E6B_heuristic_N2" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --test-contingency-filter 2
+
+run_eval "E6B_heuristic_N3" "$CKPT_E1" \
+  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --test-data-dir "$N3_DIR" --test-contingency-filter 3
+
+wait_all
+
+# ─── Goal 3: Robustness to unseen contingencies 
+echo "--- Goal 3: Topology transfer ---"
+
+# E3_eval: N+N-1 → N-2 transfer (adaptive LM, no dropout)
+if [[ -f "$CKPT_E3" ]]; then
   run_eval "E3_eval_n2_transfer" "$CKPT_E3" \
     --adaptive-lm --T 5 \
     --train-contingency-max 1 --test-contingency-filter 2
 fi
 
-# --- E4: N-{1,2}→N-3 transfer (E1 checkpoint, N-3 test set) ---
-run_eval "E4_n3_transfer" "$CKPT_E1" \
-  --adaptive-lm --T 5 \
-  --test-data-dir "$N3_DIR" --test-contingency-filter 3
-
-# --- E5A_eval: No-dropout baseline transfer (E3 checkpoint on n-2) ---
-if [[ -n "$CKPT_E3" ]]; then
-  run_eval "E5A_eval_nodropout_n2" "$CKPT_E3" \
-    --adaptive-lm --T 5 \
-    --train-contingency-max 1 --test-contingency-filter 2
-fi
-
-# --- E5B_eval: Dropout transfer (E5B checkpoint on n-2) ---
-if [[ -n "$CKPT_E5B" ]]; then
+# E5B_eval: N+N-1 → N-2 transfer (adaptive LM, with edge dropout)
+if [[ -f "$CKPT_E5B" ]]; then
   run_eval "E5B_eval_dropout_n2" "$CKPT_E5B" \
     --adaptive-lm --T 5 \
     --train-contingency-max 1 --test-contingency-filter 2
 fi
 
-# --- E6: Calibration deep-dive (uses E1 checkpoint) ---
-run_eval "E6_calibration" "$CKPT_E1" \
-  --adaptive-lm --T 5
+# E4: N-{1,2} → N-3 transfer (E1, full-trained, N-3 test set)
+run_eval "E4_n3_transfer" "$CKPT_E1" \
+  --adaptive-lm --T 5 \
+  --test-data-dir "$N3_DIR" --test-contingency-filter 3
 
-# --- E8B_eval: Regularised solver eval ---
-if [[ -n "$CKPT_E8B" ]]; then
-  run_eval "E8B_eval_regularised" "$CKPT_E8B" \
-    --T 5
+# E3 → N-3 transfer (trained on N+N-1 only, no dropout)
+if [[ -f "$CKPT_E3" ]]; then
+  run_eval "E3_eval_n3_transfer" "$CKPT_E3" \
+    --adaptive-lm --T 5 \
+    --train-contingency-max 1 \
+    --test-data-dir "$N3_DIR" --test-contingency-filter 3
+fi
+
+# E5B → N-3 transfer (trained on N+N-1, with edge dropout)
+if [[ -f "$CKPT_E5B" ]]; then
+  run_eval "E5B_eval_n3_transfer" "$CKPT_E5B" \
+    --adaptive-lm --T 5 \
+    --train-contingency-max 1 --edge-dropout 0.05 \
+    --test-data-dir "$N3_DIR" --test-contingency-filter 3
 fi
 
 wait_all
 
+echo "============================================================"
 echo " All experiments complete!"
 echo " Logs: ${LOG_DIR}/"
 echo " Checkpoints: ${CKPT_DIR}/"
 echo " W&B project: ${WANDB_PROJECT}"
+echo "============================================================"

@@ -133,6 +133,7 @@ class Config:
     test_data_dir: str = ""
     train_contingency_max: int = -1   # -1 = all, else keep ≤ this order
     test_contingency_filter: int = -1  # -1 = all, else keep == this order
+    infeas_detect_mode: str = "combined"  # "combined", "learned_only", "heuristic_only"
 
     # Paths
     data_dir: str = "data/processed/task4_solvability"
@@ -148,7 +149,8 @@ def generate_run_signature(cfg: Config) -> str:
     # Exclude system/path keys that don't affect model logic
     ignore_keys = {"data_dir", "checkpoint_dir", "log_dir", "wandb_project",
                    "num_workers", "pin_memory", "wandb_run_name",
-                   "test_data_dir", "test_contingency_filter"}
+                   "test_data_dir", "test_contingency_filter",
+                   "infeas_detect_mode"}
     for k in ignore_keys:
         d.pop(k, None)
     
@@ -392,6 +394,65 @@ def denormalize_edge_features(
         "tap": ea_raw[:, 6],
         "shift": ea_raw[:, 7],
     }
+
+
+def extract_per_graph_standalone(
+    data: Batch,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
+    edge_mean: torch.Tensor,
+    edge_std: torch.Tensor,
+    bidirectional: bool = True,
+) -> Tuple[List[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+    """Extract per-graph physics info from a batch (no model needed).
+
+    Returns (per_graph_list, node_raw_dict).  Mirrors the logic of
+    BifurcationAwarePFSolver._extract_per_graph but works without
+    model parameters, making it usable for baselines.
+    """
+    node_raw = denormalize_node_features(data.x, x_mean, x_std)
+    edge_raw = denormalize_edge_features(data.edge_attr, edge_mean, edge_std)
+    batch_idx = data.batch
+    edge_batch = batch_idx[data.edge_index[0]]
+
+    _, counts = torch.unique_consecutive(batch_idx, return_counts=True)
+    offsets = torch.zeros(
+        counts.shape[0] + 1, dtype=torch.long, device=counts.device
+    )
+    offsets[1:] = counts.cumsum(0)
+
+    per_graph: List[Dict[str, torch.Tensor]] = []
+    for g_idx in range(counts.shape[0]):
+        lo = offsets[g_idx].item()
+        hi = offsets[g_idx + 1].item()
+        n_g = hi - lo
+
+        edge_mask = edge_batch == g_idx
+        ei_g = data.edge_index[:, edge_mask] - lo
+        ea_g = {k: v[edge_mask] for k, v in edge_raw.items()}
+
+        if bidirectional:
+            fwd = ei_g[0] < ei_g[1]
+            ei_phys = ei_g[:, fwd]
+            ea_phys = {k: v[fwd] for k, v in ea_g.items()}
+        else:
+            ei_phys = ei_g
+            ea_phys = ea_g
+
+        per_graph.append(
+            {
+                "edge_index": ei_phys,
+                "edge_attr_raw": ea_phys,
+                "p_spec": node_raw["pg"][lo:hi] - node_raw["pd"][lo:hi],
+                "q_spec": -node_raw["qd"][lo:hi],
+                "gs": node_raw["gs"][lo:hi],
+                "bs": node_raw["bs"][lo:hi],
+                "bus_type": node_raw["bus_type"][lo:hi],
+                "vm_setpoint": node_raw["vm_setpoint"][lo:hi],
+                "n": n_g,
+            }
+        )
+    return per_graph, node_raw
 
 
 # ============================================================================
@@ -1842,6 +1903,140 @@ class InferenceEngine:
         self.cfg = cfg
         self.device = device
 
+    # ── reject-curve analysis (concern 5) ─────────────────────────────
+    @staticmethod
+    def _compute_reject_curves(
+        metrics: Dict[str, float],
+        all_true_feasible: List[bool],
+        all_state_mse: List[float],
+        all_final_mu: List[float],
+        all_final_residual: List[float],
+    ) -> None:
+        """Coverage-accuracy reject curves for μ and residual signals.
+
+        For a set of thresholds on the *uncertainty signal*, compute the
+        fraction of feasible samples accepted (coverage) and the MSE on
+        those accepted samples (conditional accuracy).  A good signal
+        should let us drop a small fraction of hard samples and achieve
+        a large accuracy gain.
+        """
+        feas_idx = [
+            j for j, f in enumerate(all_true_feasible) if f
+        ]
+        if len(feas_idx) < 5:
+            return
+
+        feas_mse = np.array([all_state_mse[j] for j in feas_idx])
+        feas_mu = np.array([all_final_mu[j] for j in feas_idx])
+        feas_res = np.array([all_final_residual[j] for j in feas_idx])
+
+        valid = ~np.isnan(feas_mse)
+        if valid.sum() < 5:
+            return
+
+        coverages = [0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
+
+        def _reject_curve(signal: np.ndarray, label: str):
+            """Compute conditional MSE at each coverage level."""
+            order = np.argsort(signal)
+            valid_signal = valid[order]
+            mse_sorted = feas_mse[order]
+            n_valid = int(valid_signal.sum())
+            for cov in coverages:
+                k = max(1, int(cov * n_valid))
+                accepted_mask = np.zeros(len(order), dtype=bool)
+                count = 0
+                for idx in order:
+                    if valid[idx]:
+                        accepted_mask[idx] = True
+                        count += 1
+                        if count >= k:
+                            break
+                sel = accepted_mask & valid
+                if sel.sum() > 0:
+                    cond_mse = float(feas_mse[sel].mean())
+                    cov_pct = int(cov * 100)
+                    metrics[f"inference/reject_{label}_mse@cov{cov_pct}"] = cond_mse
+
+            # AUROC: can the signal distinguish high-error from low-error?
+            median_mse = float(np.median(feas_mse[valid]))
+            y_hard = [
+                1 if feas_mse[j] > median_mse and valid[j] else 0
+                for j in range(len(feas_mse))
+            ]
+            y_score = [float(signal[j]) for j in range(len(signal))]
+            y_hard_f = [y for y, v in zip(y_hard, valid) if v]
+            y_score_f = [s for s, v in zip(y_score, valid) if v]
+            if len(set(y_hard_f)) > 1:
+                auroc = _compute_auroc(y_hard_f, y_score_f)
+                metrics[f"inference/reject_{label}_auroc_hard_detect"] = auroc
+
+        # Residual-based reject curve (always available)
+        _reject_curve(feas_res, "residual")
+
+        # μ-based reject curve (adaptive LM only)
+        if feas_mu.max() > 0:
+            _reject_curve(feas_mu, "mu")
+
+        log.info(
+            "  Reject curves computed (signals: residual%s)",
+            ", mu" if feas_mu.max() > 0 else "",
+        )
+
+    # ── μ-trajectory analysis (concern 5) ─────────────────────────────
+    @staticmethod
+    def _compute_mu_trajectory_stats(
+        metrics: Dict[str, float],
+        all_mu_trajectories: List[List[float]],
+        all_converged: List[bool],
+        all_kappa_bin: List[int],
+    ) -> None:
+        """Summarise per-step μ trajectories.
+
+        Reports mean μ at each solver step for converged vs non-converged
+        samples, and per-difficulty-bin.
+        """
+        traj_conv = [t for t, c in zip(all_mu_trajectories, all_converged)
+                     if c and len(t) > 0]
+        traj_nonconv = [t for t, c in zip(all_mu_trajectories, all_converged)
+                        if (not c) and len(t) > 0]
+
+        def _mean_at_step(trajs, step):
+            vals = [t[step] for t in trajs if step < len(t)]
+            return float(np.mean(vals)) if vals else float("nan")
+
+        if traj_conv:
+            max_steps = max(len(t) for t in traj_conv)
+            for s in range(min(max_steps, 20)):
+                metrics[f"inference/mu_traj_conv_step{s}"] = _mean_at_step(traj_conv, s)
+            # Growth rate: ratio of last to first μ
+            ratios = [t[-1] / max(t[0], 1e-12) for t in traj_conv if len(t) >= 2]
+            if ratios:
+                metrics["inference/mu_growth_rate_conv"] = float(np.median(ratios))
+
+        if traj_nonconv:
+            max_steps = max(len(t) for t in traj_nonconv)
+            for s in range(min(max_steps, 20)):
+                metrics[f"inference/mu_traj_nonconv_step{s}"] = _mean_at_step(traj_nonconv, s)
+            ratios = [t[-1] / max(t[0], 1e-12) for t in traj_nonconv if len(t) >= 2]
+            if ratios:
+                metrics["inference/mu_growth_rate_nonconv"] = float(np.median(ratios))
+
+        # Per-bin mean final μ
+        for bin_id, bin_name in enumerate(DIFFICULTY_BIN_NAMES):
+            bin_trajs = [t for t, k in zip(all_mu_trajectories, all_kappa_bin)
+                         if k == bin_id and len(t) > 0]
+            if bin_trajs:
+                final_mus = [t[-1] for t in bin_trajs]
+                metrics[f"inference/mu_final_bin_{bin_name}"] = float(np.mean(final_mus))
+
+        n_with_traj = sum(1 for t in all_mu_trajectories if len(t) > 0)
+        if n_with_traj > 0:
+            log.info(
+                "  μ-trajectory: %d converged, %d non-converged",
+                len(traj_conv), len(traj_nonconv),
+            )
+
     @torch.no_grad()
     def run(
         self,
@@ -1865,6 +2060,9 @@ class InferenceEngine:
         all_infeas_prob: List[float] = []   # P(feasible) = sigmoid(logit)
         all_kappa_bin: List[int] = []
         all_final_mu: List[float] = []
+        all_max_vm_error: List[float] = []
+        all_iters_to_converge: List[int] = []
+        all_mu_trajectories: List[List[float]] = []
 
         loader_bar = tqdm(
             dataloader,
@@ -1935,6 +2133,12 @@ class InferenceEngine:
 
                 pred_infeasible = pred_infeas_learned or heuristic_flag
 
+                detect_mode = self.cfg.infeas_detect_mode
+                if detect_mode == "learned_only":
+                    pred_infeasible = pred_infeas_learned
+                elif detect_mode == "heuristic_only":
+                    pred_infeasible = heuristic_flag
+
                 all_converged.append(converged)
                 all_pred_infeasible.append(pred_infeasible)
                 all_true_feasible.append(
@@ -1955,11 +2159,31 @@ class InferenceEngine:
                     mse = float("nan")
                 all_state_mse.append(mse)
 
+                # ── Max per-bus voltage error (feasible only) ──
+                if data.feasible_mask[i].item():
+                    max_vm_err = (vm_pred - vm_true).abs().max().item()
+                else:
+                    max_vm_err = float("nan")
+                all_max_vm_error.append(max_vm_err)
+
+                # ── Iterations used by solver ──
+                all_iters_to_converge.append(len(residuals))
+
                 # ── Other per-sample metrics ──
                 all_final_residual.append(res_inf)
                 all_infeas_prob.append(
                     torch.sigmoid(infeas_logits[i]).item())
                 all_final_mu.append(mu_f)
+
+                # μ-trajectory
+                if (
+                    self.cfg.use_adaptive_lm
+                    and outputs.get("mu_trajectory")
+                    and i < len(outputs["mu_trajectory"])
+                ):
+                    all_mu_trajectories.append(outputs["mu_trajectory"][i])
+                else:
+                    all_mu_trajectories.append([])
 
                 # Difficulty bin
                 if hasattr(data, "difficulty_bin"):
@@ -2015,6 +2239,21 @@ class InferenceEngine:
             "inference/total_samples": total_samples,
         }
 
+        # Max bus voltage error (feasible only)
+        feas_max_vm = [m for m in all_max_vm_error if not np.isnan(m)]
+        if feas_max_vm:
+            metrics["inference/max_vm_error_mean"] = float(np.mean(feas_max_vm))
+            metrics["inference/max_vm_error_p95"] = float(
+                np.percentile(feas_max_vm, 95))
+            metrics["inference/max_vm_error_worst"] = float(np.max(feas_max_vm))
+
+        # Iterations to convergence
+        metrics["inference/mean_iters"] = float(np.mean(all_iters_to_converge))
+        conv_iters = [
+            n for n, c in zip(all_iters_to_converge, all_converged) if c]
+        if conv_iters:
+            metrics["inference/mean_iters_converged"] = float(np.mean(conv_iters))
+
         # ──────────────────────────────────────────────────────────────
         # PER-DIFFICULTY-BIN METRICS
         # ──────────────────────────────────────────────────────────────
@@ -2038,6 +2277,12 @@ class InferenceEngine:
             bin_res = [
                 v for v, m in zip(all_final_residual, bin_mask) if m]
             metrics[f"{pfx}/mean_residual"] = float(np.mean(bin_res))
+            bin_max_vm = [
+                v for v, m in zip(all_max_vm_error, bin_mask)
+                if m and not np.isnan(v)
+            ]
+            if bin_max_vm:
+                metrics[f"{pfx}/max_vm_error"] = float(np.mean(bin_max_vm))
 
             # Per-bin infeasibility P/R/F1
             bin_tp = sum(
@@ -2111,6 +2356,24 @@ class InferenceEngine:
                 _compute_spearman(list(rv), list(ev)))
 
         # ──────────────────────────────────────────────────────────────
+        # REJECT-CURVE ANALYSIS  (concern 5: trustworthiness)
+        # ──────────────────────────────────────────────────────────────
+        self._compute_reject_curves(
+            metrics,
+            all_true_feasible, all_state_mse,
+            all_final_mu, all_final_residual,
+        )
+
+        # ──────────────────────────────────────────────────────────────
+        # μ-TRAJECTORY ANALYSIS  (concern 5: trustworthiness)
+        # ──────────────────────────────────────────────────────────────
+        if self.cfg.use_adaptive_lm:
+            self._compute_mu_trajectory_stats(
+                metrics,
+                all_mu_trajectories, all_converged, all_kappa_bin,
+            )
+
+        # ──────────────────────────────────────────────────────────────
         # LOGGING
         # ──────────────────────────────────────────────────────────────
         if _WANDB_AVAILABLE and wandb.run is not None:
@@ -2118,10 +2381,18 @@ class InferenceEngine:
 
         log.info(
             "Inference: %d samples  %.2fs (%.4fs/sample)  conv=%.3f  "
-            "state_mse=%.6f  infeas P/R/F1=%.3f/%.3f/%.3f",
+            "state_mse=%.6f  infeas P/R/F1=%.3f/%.3f/%.3f  detect=%s",
             total_samples, total_time, per_sample, conv_rate,
-            overall_state_mse, prec, rec, f1,
+            overall_state_mse, prec, rec, f1, self.cfg.infeas_detect_mode,
         )
+        if "inference/max_vm_error_mean" in metrics:
+            log.info(
+                "  MaxVmErr mean=%.6f  p95=%.6f  worst=%.6f  avg_iters=%.1f",
+                metrics["inference/max_vm_error_mean"],
+                metrics["inference/max_vm_error_p95"],
+                metrics["inference/max_vm_error_worst"],
+                metrics["inference/mean_iters"],
+            )
         if "inference/infeasibility_auroc" in metrics:
             log.info(
                 "  AUROC=%.4f  ECE=%.4f",
@@ -2139,12 +2410,42 @@ class InferenceEngine:
                 metrics["inference/spearman_residual_vs_error"],
             )
 
+        # Reject-curve summary
+        for signal in ("residual", "mu"):
+            k90 = f"inference/reject_{signal}_mse@cov90"
+            k100 = f"inference/reject_{signal}_mse@cov100"
+            if k90 in metrics and k100 in metrics:
+                log.info(
+                    "  Reject(%s)  mse@90%%=%.6f  mse@100%%=%.6f  "
+                    "gain=%.1f%%",
+                    signal,
+                    metrics[k90],
+                    metrics[k100],
+                    100 * (1 - metrics[k90] / max(metrics[k100], 1e-12)),
+                )
+        for signal in ("residual", "mu"):
+            kad = f"inference/reject_{signal}_auroc_hard_detect"
+            if kad in metrics:
+                log.info(
+                    "  Reject(%s)  hard-detect AUROC=%.4f", signal, metrics[kad],
+                )
+
+        # μ-trajectory summary
+        if "inference/mu_growth_rate_conv" in metrics:
+            log.info(
+                "  μ-traj growth: conv=%.2f  nonconv=%s",
+                metrics["inference/mu_growth_rate_conv"],
+                f"{metrics['inference/mu_growth_rate_nonconv']:.2f}"
+                if "inference/mu_growth_rate_nonconv" in metrics
+                else "N/A",
+            )
+
         # Per-bin summary
         for bin_name in DIFFICULTY_BIN_NAMES:
             pfx = f"inference/bin_{bin_name}"
             if f"{pfx}/count" in metrics:
                 log.info(
-                    "  [%s] n=%d  conv=%.3f  mse=%s  residual=%.6f",
+                    "  [%s] n=%d  conv=%.3f  mse=%s  residual=%.6f  max_vm=%s",
                     bin_name,
                     int(metrics[f"{pfx}/count"]),
                     metrics[f"{pfx}/conv_rate"],
@@ -2152,9 +2453,242 @@ class InferenceEngine:
                     if f"{pfx}/state_mse" in metrics
                     else "N/A",
                     metrics[f"{pfx}/mean_residual"],
+                    f"{metrics[pfx + '/max_vm_error']:.6f}"
+                    if f"{pfx}/max_vm_error" in metrics
+                    else "N/A",
                 )
 
         model.solver.T = orig_T
+        return metrics
+
+
+# ============================================================================
+# FLAT-START BASELINE  (concern 1: external baseline comparison)
+# ============================================================================
+class FlatStartBaseline:
+    """Flat-start LM/NR solver baseline — no GNN warm-start.
+
+    Initialises voltage as va=0 for all buses, vm=vm_setpoint for PV/slack
+    and vm=1.0 for PQ, then runs the adaptive-LM solver.  This quantifies
+    the value of the GNN initial guess by comparison.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        device: torch.device,
+        norm_stats: Dict[str, torch.Tensor],
+    ):
+        self.cfg = cfg
+        self.device = device
+        self.x_mean = norm_stats["x_mean"].to(device)
+        self.x_std = norm_stats["x_std"].to(device)
+        self.edge_mean = norm_stats["edge_mean"].to(device)
+        self.edge_std = norm_stats["edge_std"].to(device)
+        self.solver = UnrolledSolver(
+            T=cfg.max_iter_inference,
+            epsilon=cfg.epsilon,
+            vm_min=cfg.vm_min,
+            vm_max=cfg.vm_max,
+        )
+
+    def _flat_start(
+        self, per_graph: List[Dict[str, torch.Tensor]],
+    ) -> List[torch.Tensor]:
+        """Create flat-start voltage vectors."""
+        x_list: List[torch.Tensor] = []
+        for gi in per_graph:
+            n = gi["n"]
+            va = torch.zeros(n, device=self.device, dtype=torch.float32)
+            vm = torch.ones(n, device=self.device, dtype=torch.float32)
+            pv_slack = (gi["bus_type"] == 2) | (gi["bus_type"] == 3)
+            vm[pv_slack] = gi["vm_setpoint"][pv_slack].float()
+            x_list.append(torch.cat([va, vm]))
+        return x_list
+
+    @torch.no_grad()
+    def run(
+        self,
+        dataloader: DataLoader,
+        silent: bool = False,
+    ) -> Dict[str, float]:
+        all_converged: List[bool] = []
+        all_true_feasible: List[bool] = []
+        all_state_mse: List[float] = []
+        all_final_residual: List[float] = []
+        all_max_vm_error: List[float] = []
+        all_iters_to_converge: List[int] = []
+        all_kappa_bin: List[int] = []
+        all_final_mu: List[float] = []
+        total_samples = 0
+        total_time = 0.0
+
+        loader_bar = tqdm(
+            dataloader, desc="FlatStart", unit="batch", disable=silent,
+        )
+        for data in loader_bar:
+            data = data.to(self.device)
+            B_g = data.batch.unique().shape[0]
+            total_samples += B_g
+
+            per_graph, _node_raw = extract_per_graph_standalone(
+                data, self.x_mean, self.x_std,
+                self.edge_mean, self.edge_std,
+                bidirectional=self.cfg.bidirectional_edges,
+            )
+            x_flat = self._flat_start(per_graph)
+
+            t0 = time.time()
+            x_final_list, residuals_out, mu_list, _mu_traj = (
+                self.solver.forward_batch_adaptive_lm(
+                    x_flat, per_graph, self.cfg,
+                )
+            )
+            total_time += time.time() - t0
+
+            node_offset = 0
+            for i, (x_f, gi) in enumerate(zip(x_final_list, per_graph)):
+                n_g = gi["n"]
+                F_final = PowerFlowPhysics.compute_mismatch_from_x(
+                    x_f,
+                    gi["edge_index"],
+                    gi["edge_attr_raw"],
+                    gi["p_spec"],
+                    gi["q_spec"],
+                    gi["gs"],
+                    gi["bs"],
+                    gi["bus_type"],
+                    gi["vm_setpoint"],
+                )
+                res_inf = F_final.abs().max().item()
+                converged = res_inf < self.cfg.epsilon
+                all_converged.append(converged)
+                all_final_residual.append(res_inf)
+                all_iters_to_converge.append(len(residuals_out[i]))
+                all_final_mu.append(mu_list[i])
+
+                true_feas = bool(data.feasible_mask[i].item())
+                all_true_feasible.append(true_feas)
+
+                if true_feas:
+                    va_pred = x_f[:n_g]
+                    vm_pred = x_f[n_g:]
+                    va_true = data.y_state[
+                        node_offset : node_offset + n_g, 0
+                    ].to(x_f.device)
+                    vm_true = data.y_state[
+                        node_offset : node_offset + n_g, 1
+                    ].to(x_f.device)
+                    mse = (
+                        (va_pred - va_true).pow(2).mean()
+                        + (vm_pred - vm_true).pow(2).mean()
+                    ).item() / 2.0
+                    max_vm_err = (vm_pred - vm_true).abs().max().item()
+                else:
+                    mse = float("nan")
+                    max_vm_err = float("nan")
+                all_state_mse.append(mse)
+                all_max_vm_error.append(max_vm_err)
+
+                if hasattr(data, "difficulty_bin"):
+                    all_kappa_bin.append(int(data.difficulty_bin[i].item()))
+                elif hasattr(data, "y_solvability"):
+                    all_kappa_bin.append(
+                        assign_difficulty_bin(data.y_solvability[i].item()))
+                else:
+                    all_kappa_bin.append(-1)
+
+                node_offset += n_g
+
+            loader_bar.set_postfix(samples=total_samples)
+
+        # ── aggregate ──────────────────────────────────────────────────
+        conv_rate = sum(all_converged) / max(total_samples, 1)
+        true_feasible_count = sum(all_true_feasible)
+        feasible_converged = sum(
+            c and t for c, t in zip(all_converged, all_true_feasible))
+        feasible_conv_rate = feasible_converged / max(true_feasible_count, 1)
+
+        feas_mse_vals = [m for m in all_state_mse if not np.isnan(m)]
+        overall_mse = float(np.mean(feas_mse_vals)) if feas_mse_vals else 0.0
+        per_sample = total_time / max(total_samples, 1)
+
+        metrics: Dict[str, float] = {
+            "baseline/total_time_s": total_time,
+            "baseline/per_sample_time_s": per_sample,
+            "baseline/convergence_rate": conv_rate,
+            "baseline/feasible_conv_rate": feasible_conv_rate,
+            "baseline/state_mse": overall_mse,
+            "baseline/total_samples": total_samples,
+            "baseline/mean_iters": float(np.mean(all_iters_to_converge)),
+        }
+
+        feas_max_vm = [m for m in all_max_vm_error if not np.isnan(m)]
+        if feas_max_vm:
+            metrics["baseline/max_vm_error_mean"] = float(np.mean(feas_max_vm))
+            metrics["baseline/max_vm_error_p95"] = float(
+                np.percentile(feas_max_vm, 95))
+            metrics["baseline/max_vm_error_worst"] = float(np.max(feas_max_vm))
+
+        conv_iters = [
+            n for n, c in zip(all_iters_to_converge, all_converged) if c]
+        if conv_iters:
+            metrics["baseline/mean_iters_converged"] = float(np.mean(conv_iters))
+
+        # Per-difficulty-bin breakdown
+        for bin_id, bin_name in enumerate(DIFFICULTY_BIN_NAMES):
+            bin_mask = [k == bin_id for k in all_kappa_bin]
+            n_bin = sum(bin_mask)
+            if n_bin == 0:
+                continue
+            pfx = f"baseline/bin_{bin_name}"
+            metrics[f"{pfx}/count"] = n_bin
+            metrics[f"{pfx}/conv_rate"] = (
+                sum(c for c, m in zip(all_converged, bin_mask) if m) / n_bin)
+            bin_mse = [
+                v for v, m in zip(all_state_mse, bin_mask)
+                if m and not np.isnan(v)]
+            if bin_mse:
+                metrics[f"{pfx}/state_mse"] = float(np.mean(bin_mse))
+            bin_res = [v for v, m in zip(all_final_residual, bin_mask) if m]
+            metrics[f"{pfx}/mean_residual"] = float(np.mean(bin_res))
+            bin_max_vm = [
+                v for v, m in zip(all_max_vm_error, bin_mask)
+                if m and not np.isnan(v)]
+            if bin_max_vm:
+                metrics[f"{pfx}/max_vm_error"] = float(np.mean(bin_max_vm))
+
+        # W&B
+        if _WANDB_AVAILABLE and wandb.run is not None:
+            wandb.log(metrics)
+
+        log.info(
+            "FlatStart: %d samples  %.2fs (%.4fs/sample)  conv=%.3f  "
+            "feas_conv=%.3f  state_mse=%.6f  avg_iters=%.1f",
+            total_samples, total_time, per_sample, conv_rate,
+            feasible_conv_rate, overall_mse,
+            metrics["baseline/mean_iters"],
+        )
+        if "baseline/max_vm_error_mean" in metrics:
+            log.info(
+                "  MaxVmErr mean=%.6f  p95=%.6f  worst=%.6f",
+                metrics["baseline/max_vm_error_mean"],
+                metrics["baseline/max_vm_error_p95"],
+                metrics["baseline/max_vm_error_worst"],
+            )
+        for bin_name in DIFFICULTY_BIN_NAMES:
+            pfx = f"baseline/bin_{bin_name}"
+            if f"{pfx}/count" in metrics:
+                log.info(
+                    "  [%s] n=%d  conv=%.3f  mse=%s  residual=%.6f",
+                    bin_name,
+                    int(metrics[f"{pfx}/count"]),
+                    metrics[f"{pfx}/conv_rate"],
+                    f"{metrics[pfx + '/state_mse']:.6f}"
+                    if f"{pfx}/state_mse" in metrics else "N/A",
+                    metrics[f"{pfx}/mean_residual"],
+                )
+
         return metrics
 
 
@@ -2403,6 +2937,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Keep only train/val samples with contingency_order ≤ N.")
     g.add_argument("--test-contingency-filter", type=int, default=-1,
                    help="Keep only test samples with contingency_order == N.")
+    g.add_argument("--infeas-detect-mode",
+                   choices=["combined", "learned_only", "heuristic_only"],
+                   default="combined",
+                   help="Which signals to use for infeasibility prediction during eval.")
 
     # ── run mode ──
     g = p.add_argument_group("Run mode")
@@ -2411,6 +2949,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--resume-from", default=None)
     g.add_argument("--eval-only", default=None)
+    g.add_argument("--print-signature", action="store_true",
+                   help="Print the run signature and exit (no training).")
+
+    # ── baselines ──
+    g = p.add_argument_group("Baselines")
+    g.add_argument(
+        "--baseline",
+        choices=["flat-start"],
+        default=None,
+        help="Run a baseline instead of the full model.\n"
+             "  flat-start: LM solver from flat voltage init (no GNN).",
+    )
 
     # ── grid search ──
     g = p.add_argument_group("Grid search")
@@ -2531,6 +3081,7 @@ def _cfg_from_args(args) -> Config:
         test_data_dir=args.test_data_dir,
         train_contingency_max=args.train_contingency_max,
         test_contingency_filter=args.test_contingency_filter,
+        infeas_detect_mode=args.infeas_detect_mode,
     )
 
 
@@ -2546,6 +3097,10 @@ def main():
         else torch.device("cuda")
     )
     log.info("Device: %s", device)
+
+    if args.print_signature:
+        print(generate_run_signature(cfg))
+        return
 
     # ── grid search mode ──
     if args.grid_search:
@@ -2591,6 +3146,27 @@ def main():
         len(val_loader.dataset),
         len(test_loader.dataset),
     )
+
+    # ── baseline mode ──
+    if args.baseline == "flat-start":
+        run_sig = generate_run_signature(cfg)
+        setup_file_logging(cfg.log_dir, prefix=f"baseline_flat_{run_sig}")
+        log.info("Running flat-start baseline (T=%d)", cfg.max_iter_inference)
+        if _WANDB_AVAILABLE:
+            bl_name = (
+                cfg.wandb_run_name
+                if cfg.wandb_run_name
+                else f"baseline_flat_T{cfg.max_iter_inference}"
+            )
+            wandb.init(
+                project=cfg.wandb_project, config=asdict(cfg),
+                name=bl_name, reinit=True,
+            )
+        baseline = FlatStartBaseline(cfg, device, norm_stats)
+        baseline.run(test_loader)
+        if _WANDB_AVAILABLE:
+            wandb.finish()
+        return
 
     model = BifurcationAwarePFSolver(cfg, norm_stats)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
