@@ -1,11 +1,11 @@
 {
-  "total_samples": 238400,
-  "feasible": 119200,
-  "infeasible": 119200,
+  "total_samples": 218400,
+  "feasible": 109200,
+  "infeasible": 109200,
   "splits": {
-    "train": 143040,
-    "val": 47680,
-    "test": 47680
+    "train": 131040,
+    "val": 43680,
+    "test": 43680
   },
   "node_features": [
     "pd",
@@ -43,5 +43,19 @@
     "n",
     "n-1",
     "n-2"
+  ],
+  "difficulty_bins": [
+    "easy",
+    "moderate",
+    "hard",
+    "near_infeasible",
+    "infeasible"
+  ],
+  "difficulty_bin_edges": [
+    0.0,
+    3.0,
+    6.0,
+    10.0,
+    15.0
   ]
 }
