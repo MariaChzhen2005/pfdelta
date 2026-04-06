@@ -27,7 +27,9 @@ import glob
 import time
 import argparse
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Tuple, Optional, List
 
 import numpy as np
@@ -54,6 +56,41 @@ NR_TOL = 1e-8
 INFEASIBLE_LABEL = 15.0
 SPLIT_RATIOS = (0.6, 0.2, 0.2)
 SEED = 42
+
+# κ-bin thresholds for difficulty stratification (log10 scale)
+DIFFICULTY_BIN_NAMES = ["easy", "moderate", "hard", "near_infeasible", "infeasible"]
+DIFFICULTY_BIN_EDGES = [0.0, 3.0, 6.0, 10.0, 15.0, float("inf")]
+CONTINGENCY_MAP = {"n": 0, "n-1": 1, "n-2": 2, "n-3": 3}
+
+
+def assign_difficulty_bin(y_solv: float) -> int:
+    """Map log10(κ) to difficulty bin index (0..4)."""
+    for i in range(len(DIFFICULTY_BIN_EDGES) - 1):
+        if y_solv < DIFFICULTY_BIN_EDGES[i + 1]:
+            return i
+    return len(DIFFICULTY_BIN_EDGES) - 2
+
+
+def _is_connected(n_nodes: int, edges: list) -> bool:
+    """BFS connectivity check (avoids networkx dependency)."""
+    if n_nodes <= 1:
+        return True
+    adj: List[List[int]] = [[] for _ in range(n_nodes)]
+    for s, d in edges:
+        adj[s].append(d)
+        adj[d].append(s)
+    visited = set()
+    stack = [0]
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        for nb in adj[node]:
+            if nb not in visited:
+                stack.append(nb)
+    return len(visited) == n_nodes
+
 
 DATA_ROOT = "data"
 OUTPUT_DIR = "data/processed/task4_solvability"
@@ -432,7 +469,7 @@ def make_node_features(bd: BusData) -> torch.Tensor:
 # SECTION 7: PIPELINE — PROCESS, GENERATE, NORMALIZE, SPLIT, SAVE
 # ============================================================================
 
-def process_solvable(path: str, is_cpf: bool) -> Optional[Data]:
+def process_solvable(path: str, is_cpf: bool, grid_type: str = "n") -> Optional[Data]:
     """
     Load one solvable sample → run NR → extract Jacobian → label with
     y = log10(condition_number). Falls back to warm-start if flat-start
@@ -467,11 +504,20 @@ def process_solvable(path: str, is_cpf: bool) -> Optional[Data]:
         y_state = torch.tensor(
             np.column_stack([bd.va, bd.vm]), dtype=torch.float32)
 
+        # Extract loading margin λ* from CPF data
+        y_margin = float("nan")
+        if is_cpf and "lambda" in pm:
+            y_margin = float(pm["lambda"])
+        contingency_order = CONTINGENCY_MAP.get(grid_type, 0)
+
         return Data(
             x=x, edge_index=ei, edge_attr=ea,
             y_solvability=torch.tensor(y_solv, dtype=torch.float32),
             y_state=y_state,
             feasible_mask=torch.tensor(True, dtype=torch.bool),
+            y_margin=torch.tensor(y_margin, dtype=torch.float32),
+            contingency_order=torch.tensor(contingency_order, dtype=torch.long),
+            difficulty_bin=torch.tensor(assign_difficulty_bin(y_solv), dtype=torch.long),
         )
     except Exception as e:
         log.debug("Skipping %s: %s", path, e)
@@ -480,6 +526,7 @@ def process_solvable(path: str, is_cpf: bool) -> Optional[Data]:
 
 def generate_infeasible(
     path: str, is_cpf: bool, rng: np.random.Generator,
+    grid_type: str = "n",
 ) -> Optional[Data]:
     """
     Load a solvable sample, perturb loads to infeasibility, and return
@@ -509,12 +556,16 @@ def generate_infeasible(
         )
         ei, ea = build_edges(net)
 
+        contingency_order = CONTINGENCY_MAP.get(grid_type, 0)
         return Data(
             x=x, edge_index=ei, edge_attr=ea,
             y_solvability=torch.tensor(
                 INFEASIBLE_LABEL, dtype=torch.float32),
             y_state=torch.zeros(n, 2, dtype=torch.float32),
             feasible_mask=torch.tensor(False, dtype=torch.bool),
+            y_margin=torch.tensor(0.0, dtype=torch.float32),
+            contingency_order=torch.tensor(contingency_order, dtype=torch.long),
+            difficulty_bin=torch.tensor(assign_difficulty_bin(INFEASIBLE_LABEL), dtype=torch.long),
         )
     except Exception as e:
         log.debug("Infeasible gen failed for %s: %s", path, e)
@@ -590,11 +641,133 @@ def normalize_and_save(all_data: List[Data], output_dir: str) -> None:
         "seed": SEED,
         "cases": CASES,
         "grid_types": GRID_TYPES,
+        "difficulty_bins": DIFFICULTY_BIN_NAMES,
+        "difficulty_bin_edges": DIFFICULTY_BIN_EDGES[:-1],
     }
     meta_path = os.path.join(output_dir, "metadata.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
     log.info("Saved metadata → %s", meta_path)
+
+
+# ============================================================================
+# SECTION 8: N-3 TEST SET GENERATION
+# ============================================================================
+
+def generate_n3_test_set(
+    data_root: str,
+    cases: List[str],
+    output_dir: str,
+    norm_stats_dir: str,
+    n_samples: int = 2000,
+    seed: int = SEED,
+) -> None:
+    """
+    Generate an N-3 test set by removing 3 branches from feasible n-topology
+    samples.  Output is normalised with the same stats as the main dataset
+    and saved as ``test.pt`` under *output_dir*.
+    """
+    rng = np.random.default_rng(seed)
+    samples: List[Data] = []
+
+    for case in cases:
+        raw_dir = os.path.join(data_root, case, "n", "raw")
+        if not os.path.isdir(raw_dir):
+            log.warning("N-3: %s not found — skipping.", raw_dir)
+            continue
+        fnames = sorted(glob.glob(os.path.join(raw_dir, "sample_*.json")))
+        rng.shuffle(fnames)
+
+        for fp in tqdm(fnames, desc=f"N-3 {case}"):
+            if len(samples) >= n_samples:
+                break
+            try:
+                with open(fp) as f:
+                    pm = json.load(f)
+                net, sol = parse_network(pm, False)
+                bd = extract_bus_data(net, sol)
+
+                active_bids = [
+                    bid for bid, br in net["branch"].items()
+                    if br["br_status"] != 0
+                ]
+                if len(active_bids) < 4:
+                    continue
+
+                to_remove = list(rng.choice(active_bids, size=3, replace=False))
+                net_mod = deepcopy(net)
+                for bid in to_remove:
+                    net_mod["branch"][bid]["br_status"] = 0
+
+                n_bus = len(net_mod["bus"])
+                edges = [
+                    (int(br["f_bus"]) - 1, int(br["t_bus"]) - 1)
+                    for br in net_mod["branch"].values()
+                    if br["br_status"] != 0
+                ]
+                if not _is_connected(n_bus, edges):
+                    continue
+
+                Y = build_ybus(net_mod)
+                S_spec = (bd.pg - bd.pd) + 1j * (bd.qg - bd.qd)
+                V0 = make_v0(bd)
+                V, ok, J, _ = newton_raphson(Y, S_spec, V0, bd.types)
+
+                if ok and J is not None:
+                    kappa = condition_number(J)
+                    y_solv = float(np.log10(max(kappa, 1.0)))
+                    y_state = torch.tensor(
+                        np.column_stack([np.angle(V), np.abs(V)]),
+                        dtype=torch.float32)
+                    feasible = True
+                else:
+                    y_solv = INFEASIBLE_LABEL
+                    y_state = torch.zeros(n_bus, 2, dtype=torch.float32)
+                    feasible = False
+
+                x = make_node_features(bd)
+                ei, ea = build_edges(net_mod)
+
+                samples.append(Data(
+                    x=x, edge_index=ei, edge_attr=ea,
+                    y_solvability=torch.tensor(y_solv, dtype=torch.float32),
+                    y_state=y_state,
+                    feasible_mask=torch.tensor(feasible, dtype=torch.bool),
+                    y_margin=torch.tensor(float("nan"), dtype=torch.float32),
+                    contingency_order=torch.tensor(3, dtype=torch.long),
+                    difficulty_bin=torch.tensor(
+                        assign_difficulty_bin(y_solv), dtype=torch.long),
+                ))
+            except Exception as e:
+                log.debug("N-3 gen failed for %s: %s", fp, e)
+                continue
+
+    log.info("N-3 test set: %d samples (%d feasible)",
+             len(samples),
+             sum(1 for d in samples if d.feasible_mask.item()))
+
+    if not samples:
+        log.error("No N-3 samples generated.")
+        return
+
+    # Normalise using the training statistics from the main dataset
+    ns_path = os.path.join(norm_stats_dir, "norm_stats.pt")
+    if not os.path.isfile(ns_path):
+        log.error("norm_stats.pt not found at %s", ns_path)
+        return
+    ns = torch.load(ns_path, weights_only=False)
+    for d in samples:
+        d.x = (d.x - ns["x_mean"]) / ns["x_std"]
+        d.edge_attr = (d.edge_attr - ns["edge_mean"]) / ns["edge_std"]
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, "test.pt")
+    torch.save(samples, out_path)
+    log.info("N-3 test set saved → %s", out_path)
+
+    # Also copy norm_stats so the model can load them
+    import shutil
+    shutil.copy2(ns_path, os.path.join(output_dir, "norm_stats.pt"))
 
 
 # ── Main ─────────────────────────────────────────────────────────────────
@@ -619,6 +792,18 @@ def main():
         "--skip-infeasible", action="store_true",
         help="Skip Phase 2 (infeasible generation) for debugging.",
     )
+    parser.add_argument(
+        "--generate-n3", action="store_true",
+        help="Generate an N-3 held-out test set and exit.",
+    )
+    parser.add_argument(
+        "--n3-output-dir", default="data/processed/n3_test",
+        help="Output directory for N-3 test set.",
+    )
+    parser.add_argument(
+        "--n3-samples", type=int, default=2000,
+        help="Number of N-3 test samples to generate.",
+    )
     args = parser.parse_args()
 
     cases = args.cases or CASES
@@ -627,6 +812,21 @@ def main():
     # Download any missing case data
     for case in cases:
         ensure_data(args.data_root, case)
+
+    # ── N-3 generation mode ───────────────────────────────────────────
+    if args.generate_n3:
+        log.info("=" * 60)
+        log.info("N-3 TEST SET GENERATION")
+        log.info("=" * 60)
+        generate_n3_test_set(
+            data_root=args.data_root,
+            cases=cases,
+            output_dir=args.n3_output_dir,
+            norm_stats_dir=args.output_dir,
+            n_samples=args.n3_samples,
+        )
+        log.info("Done in %.1fs", time.time() - t0)
+        return
 
     # Collect file paths
     paths = collect_sample_paths(
@@ -645,7 +845,7 @@ def main():
     solvable: List[Data] = []
     skipped = 0
     for fp, cpf, case, gt in tqdm(paths, desc="Solvable"):
-        d = process_solvable(fp, cpf)
+        d = process_solvable(fp, cpf, grid_type=gt)
         if d is not None:
             solvable.append(d)
         else:
@@ -675,8 +875,8 @@ def main():
 
         pbar = tqdm(total=target, desc="Infeasible")
         while len(infeasible) < target and stale < max_stale:
-            fp, cpf, _, _ = paths[idx % len(paths)]
-            d = generate_infeasible(fp, cpf, rng)
+            fp, cpf, _, gt = paths[idx % len(paths)]
+            d = generate_infeasible(fp, cpf, rng, grid_type=gt)
             if d is not None:
                 infeasible.append(d)
                 pbar.update(1)

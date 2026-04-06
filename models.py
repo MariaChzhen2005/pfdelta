@@ -18,6 +18,9 @@ from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GINEConv, global_mean_pool, global_add_pool
 from torch_geometric.data import Data, Batch
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 from tqdm import tqdm
 
 try:
@@ -90,7 +93,7 @@ class Config:
     weight_decay: float = 1e-5
     batch_size: int = 32
     epochs_stage1: int = 200
-    epochs_stage2: int = 30
+    epochs_stage2: int = 50
     lambda_1: float = 1.0
     lambda_2: float = 1.0
     lambda_3: float = 1e-3
@@ -122,6 +125,15 @@ class Config:
     num_workers: int = 0
     pin_memory: bool = True
 
+    # Augmentation
+    edge_dropout_p: float = 0.0
+
+    # Experiment control
+    wandb_run_name: str = ""
+    test_data_dir: str = ""
+    train_contingency_max: int = -1   # -1 = all, else keep ≤ this order
+    test_contingency_filter: int = -1  # -1 = all, else keep == this order
+
     # Paths
     data_dir: str = "data/processed/task4_solvability"
     checkpoint_dir: str = "checkpoints"
@@ -134,7 +146,9 @@ def generate_run_signature(cfg: Config) -> str:
     """Generates a unique deterministic string based on hyperparameters to prevent overwriting."""
     d = asdict(cfg)
     # Exclude system/path keys that don't affect model logic
-    ignore_keys = {"data_dir", "checkpoint_dir", "log_dir", "wandb_project", "num_workers", "pin_memory"}
+    ignore_keys = {"data_dir", "checkpoint_dir", "log_dir", "wandb_project",
+                   "num_workers", "pin_memory", "wandb_run_name",
+                   "test_data_dir", "test_contingency_filter"}
     for k in ignore_keys:
         d.pop(k, None)
     
@@ -147,10 +161,7 @@ def generate_run_signature(cfg: Config) -> str:
     return f"{readable}_{hash_str}"
 
 
-# ============================================================================
 # DEFAULT GRID-SEARCH PARAMETER SPACE
-# ============================================================================
-# Drastically reduced to 32 combinations (2 x 2 x 2 x 2 x 2)
 DEFAULT_SWEEP_GRID: Dict[str, List[Any]] = {
     "lr": [3e-4, 1e-3],
     "hidden_dim": [64, 128],
@@ -158,6 +169,119 @@ DEFAULT_SWEEP_GRID: Dict[str, List[Any]] = {
     "T": [3, 5],
     "dropout": [0.0, 0.1],
 }
+
+
+# ============================================================================
+# DIFFICULTY BINS & CALIBRATION UTILITIES
+# ============================================================================
+DIFFICULTY_BIN_NAMES = ["easy", "moderate", "hard", "near_infeasible", "infeasible"]
+DIFFICULTY_BIN_EDGES = [0.0, 3.0, 6.0, 10.0, 15.0, float("inf")]
+
+
+def assign_difficulty_bin(y_solv: float) -> int:
+    """Map log10(κ) to difficulty bin index (0..4)."""
+    for i in range(len(DIFFICULTY_BIN_EDGES) - 1):
+        if y_solv < DIFFICULTY_BIN_EDGES[i + 1]:
+            return i
+    return len(DIFFICULTY_BIN_EDGES) - 2
+
+
+def _compute_auroc(y_true: List[int], y_score: List[float]) -> float:
+    """AUROC via the Wilcoxon-Mann-Whitney statistic (no sklearn needed)."""
+    n_pos = sum(y_true)
+    n_neg = len(y_true) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    pairs = sorted(zip(y_score, y_true), reverse=True)
+    tp = 0
+    auc = 0.0
+    for _score, label in pairs:
+        if label == 1:
+            tp += 1
+        else:
+            auc += tp
+    return auc / (n_pos * n_neg)
+
+
+def _compute_ece(y_true: List[int], y_prob: List[float],
+                 n_bins: int = 10) -> float:
+    """Expected Calibration Error (lower is better)."""
+    bins = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    total = len(y_true)
+    if total == 0:
+        return 0.0
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        in_bin = [(t, p) for t, p in zip(y_true, y_prob) if lo <= p < hi]
+        if not in_bin:
+            continue
+        avg_conf = np.mean([p for _, p in in_bin])
+        avg_acc = np.mean([t for t, _ in in_bin])
+        ece += (len(in_bin) / total) * abs(avg_conf - avg_acc)
+    return ece
+
+
+def _compute_spearman(x: List[float], y: List[float]) -> float:
+    """Spearman rank correlation (no scipy needed)."""
+    n = len(x)
+    if n < 3:
+        return float("nan")
+
+    def _rank(arr):
+        sorted_idx = sorted(range(n), key=lambda i: arr[i])
+        ranks = [0.0] * n
+        for r, idx in enumerate(sorted_idx):
+            ranks[idx] = float(r + 1)
+        return ranks
+
+    rx, ry = _rank(x), _rank(y)
+    d2 = sum((a - b) ** 2 for a, b in zip(rx, ry))
+    return 1.0 - (6.0 * d2) / (n * (n * n - 1))
+
+
+# ============================================================================
+# EDGE DROPOUT AUGMENTATION
+# ============================================================================
+class RandomEdgeDropout:
+    """Drop random branches (both directions) during training.
+
+    Edges are assumed to come in contiguous pairs [f→t, t→f] per branch
+    (matching ``build_edges`` in ``data_generation.py``).
+    """
+
+    def __init__(self, p: float = 0.05):
+        self.p = p
+
+    def __call__(self, data: Data) -> Data:
+        if self.p <= 0:
+            return data
+        n_edges = data.edge_index.shape[1]
+        n_branches = n_edges // 2
+        if n_branches == 0:
+            return data
+        keep = torch.rand(n_branches) >= self.p
+        # Require at least 1 branch survives
+        if not keep.any():
+            keep[torch.randint(n_branches, (1,))] = True
+        keep_full = keep.repeat_interleave(2)
+        data = data.clone()
+        data.edge_index = data.edge_index[:, keep_full]
+        data.edge_attr = data.edge_attr[keep_full]
+        return data
+
+
+class EdgeDropoutDataset:
+    """Wraps a list of Data objects with on-the-fly edge dropout."""
+
+    def __init__(self, data_list: list, transform: RandomEdgeDropout):
+        self._data = data_list
+        self._transform = transform
+
+    def __len__(self):
+        return len(self._data)
+
+    def __getitem__(self, idx):
+        return self._transform(self._data[idx])
 
 
 # ============================================================================
@@ -171,12 +295,56 @@ def load_datasets(cfg: Config):
     val_data = torch.load(
         os.path.join(cfg.data_dir, "val.pt"), weights_only=False
     )
+
+    # Test data may come from a different directory (topology transfer / N-3)
+    test_dir = cfg.test_data_dir if cfg.test_data_dir else cfg.data_dir
     test_data = torch.load(
-        os.path.join(cfg.data_dir, "test.pt"), weights_only=False
+        os.path.join(test_dir, "test.pt"), weights_only=False
     )
     norm_stats = torch.load(
         os.path.join(cfg.data_dir, "norm_stats.pt"), weights_only=False
     )
+
+    # Filter training/val by contingency order
+    if cfg.train_contingency_max >= 0:
+        before_tr = len(train_data)
+        train_data = [
+            d for d in train_data
+            if hasattr(d, "contingency_order")
+            and d.contingency_order.item() <= cfg.train_contingency_max
+        ]
+        before_va = len(val_data)
+        val_data = [
+            d for d in val_data
+            if hasattr(d, "contingency_order")
+            and d.contingency_order.item() <= cfg.train_contingency_max
+        ]
+        log.info(
+            "Contingency filter (≤%d): train %d→%d, val %d→%d",
+            cfg.train_contingency_max,
+            before_tr, len(train_data), before_va, len(val_data),
+        )
+
+    # Filter test by exact contingency order
+    if cfg.test_contingency_filter >= 0:
+        before_te = len(test_data)
+        test_data = [
+            d for d in test_data
+            if hasattr(d, "contingency_order")
+            and d.contingency_order.item() == cfg.test_contingency_filter
+        ]
+        log.info(
+            "Test contingency filter (==%d): %d→%d",
+            cfg.test_contingency_filter, before_te, len(test_data),
+        )
+
+    # Edge dropout augmentation (training only)
+    train_set: Any = train_data
+    if cfg.edge_dropout_p > 0:
+        train_set = EdgeDropoutDataset(
+            train_data, RandomEdgeDropout(cfg.edge_dropout_p)
+        )
+        log.info("Edge dropout enabled: p=%.3f", cfg.edge_dropout_p)
 
     loader_kw: Dict[str, Any] = dict(
         num_workers=cfg.num_workers,
@@ -184,7 +352,7 @@ def load_datasets(cfg: Config):
         persistent_workers=cfg.num_workers > 0,
     )
     train_loader = DataLoader(
-        train_data, batch_size=cfg.batch_size, shuffle=True, **loader_kw
+        train_set, batch_size=cfg.batch_size, shuffle=True, **loader_kw
     )
     val_loader = DataLoader(
         val_data, batch_size=cfg.batch_size, shuffle=False, **loader_kw
@@ -930,15 +1098,16 @@ class UnrolledSolver(nn.Module):
             D_sqrt_f32 = D_sqrt_b.float()
             V_f32 = V_b.float()
 
-            last_F_max: Optional[float] = None
+            step_residuals: List[torch.Tensor] = []  # each [Bg]
             for _t in range(self.T):
                 with torch.autocast(device_type="cuda", enabled=False), torch.autocast(device_type="cpu", enabled=False):
                     x_f32 = x.float()
                     F_batch, J_batch = BatchedPhysics.mismatch_and_jacobian(
                         x_f32, prep_f32, n_nodes
                     )
-                    max_res = F_batch.detach().abs().amax(dim=1).max().item()
-                    last_F_max = max_res
+                    step_residuals.append(
+                        F_batch.detach().abs().amax(dim=1))
+                    max_res = step_residuals[-1].max().item()
                     if max_res < self.epsilon:
                         break
 
@@ -964,10 +1133,9 @@ class UnrolledSolver(nn.Module):
 
             for b_idx, global_idx in enumerate(indices):
                 x_final_out[global_idx] = x[b_idx]
-                if last_F_max is not None:
-                    residuals_out[global_idx] = [
-                        F_batch[b_idx].detach().abs().max().item()
-                    ]
+                residuals_out[global_idx] = [
+                    sr[b_idx].item() for sr in step_residuals
+                ]
 
         return x_final_out, residuals_out  # type: ignore[return-value]
 
@@ -989,6 +1157,7 @@ class UnrolledSolver(nn.Module):
         x_final_out: List[Optional[torch.Tensor]] = [None] * B
         residuals_out: List[List[float]] = [[] for _ in range(B)]
         mu_out: List[float] = [cfg.mu_init] * B
+        mu_trajectory_out: List[List[float]] = [[] for _ in range(B)]
 
         for n_nodes, indices in groups.items():
             Bg = len(indices)
@@ -1004,7 +1173,8 @@ class UnrolledSolver(nn.Module):
             prep_f32 = BatchedPhysics._cast_f32(prep)
 
             eye = torch.eye(dim, device=device, dtype=torch.float32).unsqueeze(0)
-            last_F_batch: Optional[torch.Tensor] = None
+            step_residuals: List[torch.Tensor] = []  # each [Bg]
+            step_mus: List[torch.Tensor] = []
 
             for _t in range(self.T):
                 with torch.autocast(device_type="cuda", enabled=False), torch.autocast(device_type="cpu", enabled=False):
@@ -1012,8 +1182,10 @@ class UnrolledSolver(nn.Module):
                     F_batch, J_batch = BatchedPhysics.mismatch_and_jacobian(
                         x_f32, prep_f32, n_nodes
                     )
-                    last_F_batch = F_batch
-                    max_res = F_batch.detach().abs().amax(dim=1).max().item()
+                    step_residuals.append(
+                        F_batch.detach().abs().amax(dim=1))
+                    step_mus.append(mu.detach().clone())
+                    max_res = step_residuals[-1].max().item()
                     if max_res < self.epsilon:
                         break
 
@@ -1056,12 +1228,14 @@ class UnrolledSolver(nn.Module):
             for b_idx, global_idx in enumerate(indices):
                 x_final_out[global_idx] = x[b_idx]
                 mu_out[global_idx] = mu[b_idx].item()
-                if last_F_batch is not None:
-                    residuals_out[global_idx] = [
-                        last_F_batch[b_idx].detach().abs().max().item()
-                    ]
+                residuals_out[global_idx] = [
+                    sr[b_idx].item() for sr in step_residuals
+                ]
+                mu_trajectory_out[global_idx] = [
+                    sm[b_idx].item() for sm in step_mus
+                ]
 
-        return x_final_out, residuals_out, mu_out  # type: ignore[return-value]
+        return x_final_out, residuals_out, mu_out, mu_trajectory_out  # type: ignore[return-value]
 
 
 # ============================================================================
@@ -1178,10 +1352,11 @@ class BifurcationAwarePFSolver(nn.Module):
 
         reg_params: list = []
         final_mu_list: List[float] = []
+        mu_trajectories: List[List[float]] = []
 
         if self.cfg.use_adaptive_lm:
             if run_solver:
-                x_final_list, all_residuals, final_mu_list = (
+                x_final_list, all_residuals, final_mu_list, mu_trajectories = (
                     self.solver.forward_batch_adaptive_lm(
                         x_pred_list, per_graph, self.cfg
                     )
@@ -1210,6 +1385,7 @@ class BifurcationAwarePFSolver(nn.Module):
             "infeasibility_logits": infeas_logits,
             "residuals": all_residuals,
             "final_mu_list": final_mu_list,
+            "mu_trajectory": mu_trajectories,
         }
 
 
@@ -1372,8 +1548,14 @@ class Trainer:
         setup_file_logging(cfg.log_dir, prefix=f"run_{self.run_sig}")
 
         if _WANDB_AVAILABLE and not silent:
+            run_name = (
+                cfg.wandb_run_name
+                if cfg.wandb_run_name
+                else f"run_{self.run_sig}"
+            )
             wandb.init(
-                project=cfg.wandb_project, config=asdict(cfg), reinit=True
+                project=cfg.wandb_project, config=asdict(cfg),
+                name=run_name, reinit=True,
             )
             wandb.watch(model, log="gradients", log_freq=100)
 
@@ -1577,6 +1759,81 @@ class Trainer:
         return self.best_val_loss
 
 
+def generate_power_system_visuals(gi, x_initial, x_final, residuals, exp_id):
+    """Generates Power System Diagrams and a GIF for a specific graph."""
+    os.makedirs("visualizations", exist_ok=True)
+    n = gi["n"]
+    vm_init = x_initial[n:].cpu().numpy()
+    vm_final = x_final[n:].cpu().numpy()
+    
+    # Build the NetworkX Graph
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    src, dst = gi["edge_index"].cpu().numpy()
+    edges = list(zip(src, dst))
+    G.add_edges_from(edges)
+    
+    # Use Kamada-Kawai layout for a nice power-grid looking topology
+    pos = nx.kamada_kawai_layout(G)
+
+    # --- PLOT 1: Convergence Trajectory ---
+    if len(residuals) > 0:
+        plt.figure(figsize=(6, 4))
+        plt.plot(range(1, len(residuals) + 1), residuals, marker='o', color='blue')
+        plt.yscale("log")
+        plt.axhline(y=1e-4, color='r', linestyle='--', label='Tolerance (1e-4)')
+        plt.title(f"Solver Convergence Trajectory (Graph {exp_id})")
+        plt.xlabel("Iteration")
+        plt.ylabel("Max Mismatch (Log Scale)")
+        plt.legend()
+        plt.grid(True, which="both", ls="--", alpha=0.5)
+        plt.savefig(f"visualizations/convergence_graph_{exp_id}.png", dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # --- PLOT 2: Final Voltage Heatmap ---
+    plt.figure(figsize=(8, 6))
+    nodes = nx.draw_networkx_nodes(
+        G, pos, node_color=vm_final, cmap=plt.cm.coolwarm_r, 
+        node_size=100, vmin=0.8, vmax=1.2
+    )
+    nx.draw_networkx_edges(G, pos, alpha=0.5)
+    plt.colorbar(nodes, label="Voltage Magnitude (p.u.)")
+    plt.title(f"Final Converged State: Voltage Profile (Graph {exp_id})")
+    plt.axis("off")
+    plt.savefig(f"visualizations/voltage_heatmap_{exp_id}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # --- PLOT 3: Animated GIF (GNN Guess -> LM Solver Convergence) ---
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.axis("off")
+    
+    # Create interpolation frames to simulate the solver adjusting voltages
+    frames = 15
+    vm_history = [vm_init + (vm_final - vm_init) * (i / (frames - 1)) for i in range(frames)]
+    
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.5)
+    nodes_plot = nx.draw_networkx_nodes(
+        G, pos, node_color=vm_history[0], cmap=plt.cm.coolwarm_r, 
+        node_size=100, vmin=0.8, vmax=1.2, ax=ax
+    )
+    cbar = plt.colorbar(nodes_plot, ax=ax, label="Voltage Magnitude (p.u.)")
+    title = ax.set_title("Solver Step: 0 (GNN Initial Guess)")
+
+    def update(frame):
+        nodes_plot.set_array(vm_history[frame])
+        if frame == 0:
+            title.set_text("GNN Initial Prediction")
+        elif frame == frames - 1:
+            title.set_text("Final Converged State")
+        else:
+            title.set_text(f"LM Solver Adjusting Voltages... (Step {frame})")
+        return nodes_plot, title
+
+    ani = animation.FuncAnimation(fig, update, frames=frames, interval=200, blit=False)
+    ani.save(f"visualizations/solver_animation_{exp_id}.gif", writer='pillow', fps=5)
+    plt.close()
+    log.info(f"Visualizations saved to 'visualizations/' for Graph {exp_id}")
+    
 # ============================================================================
 # INFERENCE
 # ============================================================================
@@ -1602,6 +1859,13 @@ class InferenceEngine:
         total_samples = 0
         total_time = 0.0
 
+        # Extended collectors for stratified & calibration metrics
+        all_state_mse: List[float] = []
+        all_final_residual: List[float] = []
+        all_infeas_prob: List[float] = []   # P(feasible) = sigmoid(logit)
+        all_kappa_bin: List[int] = []
+        all_final_mu: List[float] = []
+
         loader_bar = tqdm(
             dataloader,
             desc="Inference",
@@ -1619,9 +1883,11 @@ class InferenceEngine:
 
             infeas_logits = outputs["infeasibility_logits"]
 
+            node_offset = 0
             for i, (x_f, gi) in enumerate(
                 zip(outputs["x_final_list"], outputs["per_graph"])
             ):
+                n_g = gi["n"]
                 F_final = PowerFlowPhysics.compute_mismatch_from_x(
                     x_f,
                     gi["edge_index"],
@@ -1646,6 +1912,7 @@ class InferenceEngine:
 
                 pred_infeas_learned = infeas_logits[i].item() < 0.0
 
+                mu_f = 0.0
                 if self.cfg.use_adaptive_lm:
                     mu_f = (
                         outputs["final_mu_list"][i]
@@ -1674,50 +1941,218 @@ class InferenceEngine:
                     bool(data.feasible_mask[i].item())
                 )
 
+                # ── Per-sample state MSE (feasible only) ──
+                if data.feasible_mask[i].item():
+                    va_pred = x_f[:n_g]
+                    vm_pred = x_f[n_g:]
+                    va_true = data.y_state[node_offset:node_offset + n_g, 0].to(x_f.device)
+                    vm_true = data.y_state[node_offset:node_offset + n_g, 1].to(x_f.device)
+                    mse = (
+                        (va_pred - va_true).pow(2).mean()
+                        + (vm_pred - vm_true).pow(2).mean()
+                    ).item() / 2.0
+                else:
+                    mse = float("nan")
+                all_state_mse.append(mse)
+
+                # ── Other per-sample metrics ──
+                all_final_residual.append(res_inf)
+                all_infeas_prob.append(
+                    torch.sigmoid(infeas_logits[i]).item())
+                all_final_mu.append(mu_f)
+
+                # Difficulty bin
+                if hasattr(data, "difficulty_bin"):
+                    all_kappa_bin.append(int(data.difficulty_bin[i].item()))
+                elif hasattr(data, "y_solvability"):
+                    all_kappa_bin.append(
+                        assign_difficulty_bin(data.y_solvability[i].item()))
+                else:
+                    all_kappa_bin.append(-1)
+
+                node_offset += n_g
+
             loader_bar.set_postfix(samples=total_samples)
 
+        # ──────────────────────────────────────────────────────────────
+        # AGGREGATE METRICS (original)
+        # ──────────────────────────────────────────────────────────────
         conv_rate = sum(all_converged) / max(total_samples, 1)
+        true_feasible_count = sum(all_true_feasible)
+        feasible_converged = sum(
+            c and t for c, t in zip(all_converged, all_true_feasible))
+        feasible_conv_rate = feasible_converged / max(true_feasible_count, 1)
+
+        log.info(
+            "Out of %d grids, %d are actually feasible.",
+            total_samples, true_feasible_count)
+        log.info(
+            "Solver converged on %d of them.  Feasible conv rate: %.3f",
+            feasible_converged, feasible_conv_rate)
+
         true_infeasible = [not f for f in all_true_feasible]
-        tp = sum(
-            p and t
-            for p, t in zip(all_pred_infeasible, true_infeasible)
-        )
-        fp = sum(
-            p and (not t)
-            for p, t in zip(all_pred_infeasible, true_infeasible)
-        )
-        fn = sum(
-            (not p) and t
-            for p, t in zip(all_pred_infeasible, true_infeasible)
-        )
+        tp = sum(p and t for p, t in zip(all_pred_infeasible, true_infeasible))
+        fp = sum(p and (not t) for p, t in zip(all_pred_infeasible, true_infeasible))
+        fn = sum((not p) and t for p, t in zip(all_pred_infeasible, true_infeasible))
         prec = tp / max(tp + fp, 1)
         rec = tp / max(tp + fn, 1)
         f1 = 2 * prec * rec / max(prec + rec, 1e-12)
         per_sample = total_time / max(total_samples, 1)
 
-        metrics = {
+        # Overall state MSE (feasible only)
+        feas_mse_vals = [m for m in all_state_mse if not np.isnan(m)]
+        overall_state_mse = float(np.mean(feas_mse_vals)) if feas_mse_vals else 0.0
+
+        metrics: Dict[str, float] = {
             "inference/total_time_s": total_time,
             "inference/per_sample_time_s": per_sample,
             "inference/convergence_rate": conv_rate,
+            "inference/feasible_conv_rate": feasible_conv_rate,
+            "inference/state_mse": overall_state_mse,
             "inference/infeasibility_precision": prec,
             "inference/infeasibility_recall": rec,
             "inference/infeasibility_f1": f1,
             "inference/total_samples": total_samples,
         }
+
+        # ──────────────────────────────────────────────────────────────
+        # PER-DIFFICULTY-BIN METRICS
+        # ──────────────────────────────────────────────────────────────
+        for bin_id, bin_name in enumerate(DIFFICULTY_BIN_NAMES):
+            bin_mask = [k == bin_id for k in all_kappa_bin]
+            n_bin = sum(bin_mask)
+            if n_bin == 0:
+                continue
+            pfx = f"inference/bin_{bin_name}"
+            metrics[f"{pfx}/count"] = n_bin
+            metrics[f"{pfx}/conv_rate"] = (
+                sum(c for c, m in zip(all_converged, bin_mask) if m)
+                / n_bin
+            )
+            bin_mse = [
+                v for v, m in zip(all_state_mse, bin_mask)
+                if m and not np.isnan(v)
+            ]
+            if bin_mse:
+                metrics[f"{pfx}/state_mse"] = float(np.mean(bin_mse))
+            bin_res = [
+                v for v, m in zip(all_final_residual, bin_mask) if m]
+            metrics[f"{pfx}/mean_residual"] = float(np.mean(bin_res))
+
+            # Per-bin infeasibility P/R/F1
+            bin_tp = sum(
+                p and (not f)
+                for p, f, m in zip(
+                    all_pred_infeasible, all_true_feasible, bin_mask)
+                if m
+            )
+            bin_fp = sum(
+                p and f
+                for p, f, m in zip(
+                    all_pred_infeasible, all_true_feasible, bin_mask)
+                if m
+            )
+            bin_fn = sum(
+                (not p) and (not f)
+                for p, f, m in zip(
+                    all_pred_infeasible, all_true_feasible, bin_mask)
+                if m
+            )
+            bin_prec = bin_tp / max(bin_tp + bin_fp, 1)
+            bin_rec = bin_tp / max(bin_tp + bin_fn, 1)
+            bin_f1 = (
+                2 * bin_prec * bin_rec / max(bin_prec + bin_rec, 1e-12)
+            )
+            metrics[f"{pfx}/infeas_prec"] = bin_prec
+            metrics[f"{pfx}/infeas_rec"] = bin_rec
+            metrics[f"{pfx}/infeas_f1"] = bin_f1
+
+        # ──────────────────────────────────────────────────────────────
+        # CALIBRATION METRICS
+        # ──────────────────────────────────────────────────────────────
+        # AUROC
+        if len(set(all_true_feasible)) > 1:
+            y_true_infeas = [0 if f else 1 for f in all_true_feasible]
+            y_score_infeas = [1.0 - p for p in all_infeas_prob]
+            auroc = _compute_auroc(y_true_infeas, y_score_infeas)
+            metrics["inference/infeasibility_auroc"] = auroc
+
+        # ECE (for feasibility prediction)
+        y_true_feas = [1 if f else 0 for f in all_true_feasible]
+        ece = _compute_ece(y_true_feas, all_infeas_prob)
+        metrics["inference/feasibility_ece"] = ece
+
+        # Spearman: final_mu vs state_error (feasible only, adaptive LM)
+        if self.cfg.use_adaptive_lm:
+            feas_idx = [
+                j for j, f in enumerate(all_true_feasible) if f]
+            mu_vals = [all_final_mu[j] for j in feas_idx]
+            mse_vals = [all_state_mse[j] for j in feas_idx]
+            valid = [
+                (m, e) for m, e in zip(mu_vals, mse_vals)
+                if not np.isnan(e)
+            ]
+            if len(valid) >= 3:
+                mv, ev = zip(*valid)
+                metrics["inference/spearman_mu_vs_error"] = (
+                    _compute_spearman(list(mv), list(ev)))
+
+        # Spearman: final_residual vs state_error (feasible only)
+        feas_idx_all = [j for j, f in enumerate(all_true_feasible) if f]
+        res_vals = [all_final_residual[j] for j in feas_idx_all]
+        mse_vals_all = [all_state_mse[j] for j in feas_idx_all]
+        valid_res = [
+            (r, e) for r, e in zip(res_vals, mse_vals_all)
+            if not np.isnan(e)
+        ]
+        if len(valid_res) >= 3:
+            rv, ev = zip(*valid_res)
+            metrics["inference/spearman_residual_vs_error"] = (
+                _compute_spearman(list(rv), list(ev)))
+
+        # ──────────────────────────────────────────────────────────────
+        # LOGGING
+        # ──────────────────────────────────────────────────────────────
         if _WANDB_AVAILABLE and wandb.run is not None:
             wandb.log(metrics)
 
         log.info(
             "Inference: %d samples  %.2fs (%.4fs/sample)  conv=%.3f  "
-            "infeas P/R/F1=%.3f/%.3f/%.3f",
-            total_samples,
-            total_time,
-            per_sample,
-            conv_rate,
-            prec,
-            rec,
-            f1,
+            "state_mse=%.6f  infeas P/R/F1=%.3f/%.3f/%.3f",
+            total_samples, total_time, per_sample, conv_rate,
+            overall_state_mse, prec, rec, f1,
         )
+        if "inference/infeasibility_auroc" in metrics:
+            log.info(
+                "  AUROC=%.4f  ECE=%.4f",
+                metrics["inference/infeasibility_auroc"],
+                metrics["inference/feasibility_ece"],
+            )
+        if "inference/spearman_mu_vs_error" in metrics:
+            log.info(
+                "  Spearman(μ,err)=%.4f",
+                metrics["inference/spearman_mu_vs_error"],
+            )
+        if "inference/spearman_residual_vs_error" in metrics:
+            log.info(
+                "  Spearman(‖F‖,err)=%.4f",
+                metrics["inference/spearman_residual_vs_error"],
+            )
+
+        # Per-bin summary
+        for bin_name in DIFFICULTY_BIN_NAMES:
+            pfx = f"inference/bin_{bin_name}"
+            if f"{pfx}/count" in metrics:
+                log.info(
+                    "  [%s] n=%d  conv=%.3f  mse=%s  residual=%.6f",
+                    bin_name,
+                    int(metrics[f"{pfx}/count"]),
+                    metrics[f"{pfx}/conv_rate"],
+                    f"{metrics[pfx + '/state_mse']:.6f}"
+                    if f"{pfx}/state_mse" in metrics
+                    else "N/A",
+                    metrics[f"{pfx}/mean_residual"],
+                )
 
         model.solver.T = orig_T
         return metrics
@@ -1927,7 +2362,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--weight-decay", type=float, default=1e-5)
     g.add_argument("--batch-size", type=int, default=32)
     g.add_argument("--epochs-stage1", type=int, default=200)
-    g.add_argument("--epochs-stage2", type=int, default=30)
+    g.add_argument("--epochs-stage2", type=int, default=50)
     g.add_argument("--lambda-1", type=float, default=1.0)
     g.add_argument("--lambda-2", type=float, default=1.0)
     g.add_argument("--lambda-3", type=float, default=1e-3)
@@ -1955,6 +2390,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--amp", action="store_true")
     g.add_argument("--seed", type=int, default=42)
     g.add_argument("--cpu", action="store_true")
+
+    # ── experiment control ──
+    g = p.add_argument_group("Experiment control")
+    g.add_argument("--edge-dropout", type=float, default=0.0, dest="edge_dropout_p",
+                   help="Branch dropout probability during training (0=off).")
+    g.add_argument("--wandb-run-name", default="",
+                   help="Custom W&B run name (auto-generated if empty).")
+    g.add_argument("--test-data-dir", default="",
+                   help="Load test.pt from this dir instead of --data-dir.")
+    g.add_argument("--train-contingency-max", type=int, default=-1,
+                   help="Keep only train/val samples with contingency_order ≤ N.")
+    g.add_argument("--test-contingency-filter", type=int, default=-1,
+                   help="Keep only test samples with contingency_order == N.")
 
     # ── run mode ──
     g = p.add_argument_group("Run mode")
@@ -2012,6 +2460,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="grid_results",
         help="Directory for grid-search outputs.",
     )
+    # -- visualization --
+    # g.add_argument("--output-diagrams", action="store_true", help="Generate power system plots and GIFs")
     return p
 
 
@@ -2076,6 +2526,11 @@ def _cfg_from_args(args) -> Config:
         seed=args.seed,
         num_workers=args.num_workers,
         pin_memory=True,
+        edge_dropout_p=args.edge_dropout_p,
+        wandb_run_name=args.wandb_run_name,
+        test_data_dir=args.test_data_dir,
+        train_contingency_max=args.train_contingency_max,
+        test_contingency_filter=args.test_contingency_filter,
     )
 
 
@@ -2163,8 +2618,14 @@ def main():
         _load_ckpt(args.eval_only)
         model = model.to(device)
         if _WANDB_AVAILABLE:
+            eval_run_name = (
+                cfg.wandb_run_name
+                if cfg.wandb_run_name
+                else f"eval_{run_sig}"
+            )
             wandb.init(
-                project=cfg.wandb_project, config=asdict(cfg), reinit=True
+                project=cfg.wandb_project, config=asdict(cfg),
+                name=eval_run_name, reinit=True,
             )
         engine = InferenceEngine(cfg, device)
         engine.run(model, test_loader)
