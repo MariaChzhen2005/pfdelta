@@ -27,8 +27,8 @@ WANDB_PROJECT="pfdelta-bifurcation"
 # Common flags shared by all training runs
 COMMON="--data-dir ${DATA_DIR} --checkpoint-dir ${CKPT_DIR} --log-dir ${LOG_DIR} \
 --wandb-project ${WANDB_PROJECT} --hidden-dim 64 --num-mp-layers 4 --lr 1e-3 \
---batch-size 128 --epochs-stage1 80 --epochs-stage2 20 --early-stop-patience 15 \
---seed 42 --amp"
+--batch-size 256 --epochs-stage1 25 --epochs-stage2 10 --early-stop-patience 8 \
+--scheduler-patience 5 --seed 42 --amp"
 
 # ─── Parse optional --gpus flag ─────────────────
 GPUS=""
@@ -130,10 +130,10 @@ echo "============================================================"
 echo " Computing run signatures ..."
 echo "============================================================"
 
-SIG_E1=$(get_sig --adaptive-lm --T 5 --stage both)
-SIG_E3=$(get_sig --adaptive-lm --T 5 --stage both --train-contingency-max 1)
-SIG_E5B=$(get_sig --adaptive-lm --T 5 --stage both --train-contingency-max 1 --edge-dropout 0.05)
-SIG_VANILLA=$(get_sig --adaptive-lm --T 5 --lambda-infeasibility 0)
+SIG_E1=$(get_sig --adaptive-lm --T 3 --stage both)
+SIG_E3=$(get_sig --adaptive-lm --T 3 --stage both --train-contingency-max 1)
+SIG_E5B=$(get_sig --adaptive-lm --T 3 --stage both --train-contingency-max 1 --edge-dropout 0.05)
+SIG_VANILLA=$(get_sig --adaptive-lm --T 3 --lambda-infeasibility 0)
 
 echo "  E1  (adaptive LM, full data):  ${SIG_E1}"
 echo "  E3  (adaptive LM, n+n-1):     ${SIG_E3}"
@@ -149,20 +149,20 @@ echo "============================================================"
 
 # E1 — Full model: adaptive LM, full data, both stages
 run_train "E1_baseline_adaptive_lm" \
-  --adaptive-lm --T 5 --stage both
+  --adaptive-lm --T 3 --stage both
 
 # B_VANILLA — Pure GNN regression (stage 1 only, no infeasibility loss)
 run_train "B_VANILLA_GNN" \
-  --adaptive-lm --T 5 --stage 1 --lambda-infeasibility 0
+  --adaptive-lm --T 3 --stage 1 --lambda-infeasibility 0
 
 # E3 — N+N-1 only, adaptive LM (for transfer tests)
 run_train "E3_n01_adaptive_lm" \
-  --adaptive-lm --T 5 --stage both \
+  --adaptive-lm --T 3 --stage both \
   --train-contingency-max 1
 
 # E5B — N+N-1 only, adaptive LM, edge dropout 5%
 run_train "E5B_n01_dropout005" \
-  --adaptive-lm --T 5 --stage both \
+  --adaptive-lm --T 3 --stage both \
   --train-contingency-max 1 --edge-dropout 0.05
 
 wait_all
@@ -175,7 +175,7 @@ CKPT_E3="${CKPT_DIR}/final_model_${SIG_E3}.pt"
 CKPT_E5B="${CKPT_DIR}/final_model_${SIG_E5B}.pt"
 CKPT_VANILLA="${CKPT_DIR}/final_model_${SIG_VANILLA}.pt"
 # Stage-1-only checkpoint from E1 (for concern 2: clean GNN-only baseline)
-CKPT_E1_S1="${CKPT_DIR}/epoch_80_stage1_final_${SIG_E1}.pt"
+CKPT_E1_S1="${CKPT_DIR}/epoch_25_stage1_final_${SIG_E1}.pt"
 
 for name_ckpt in "E1:${CKPT_E1}" "E1_S1:${CKPT_E1_S1}" "E3:${CKPT_E3}" "E5B:${CKPT_E5B}" "VANILLA:${CKPT_VANILLA}"; do
   name="${name_ckpt%%:*}"
@@ -199,15 +199,15 @@ echo "--- Concern 1: Baselines ---"
 
 # B_FLAT_T5:  Flat-start LM baseline at T=5  (same budget as model)
 run_train "B_FLAT_T5" \
-  --adaptive-lm --T 5 --max-iter-inference 5 --baseline flat-start
+  --adaptive-lm --T 3 --max-iter-inference 5 --baseline flat-start
 
 # B_FLAT_T20: Flat-start LM baseline at T=20 (generous budget)
 run_train "B_FLAT_T20" \
-  --adaptive-lm --T 5 --max-iter-inference 20 --baseline flat-start
+  --adaptive-lm --T 3 --max-iter-inference 20 --baseline flat-start
 
 # B_FLAT_T50: Flat-start LM baseline at T=50 (very generous)
 run_train "B_FLAT_T50" \
-  --adaptive-lm --T 5 --max-iter-inference 50 --baseline flat-start
+  --adaptive-lm --T 3 --max-iter-inference 50 --baseline flat-start
 
 wait_all
 
@@ -217,21 +217,21 @@ echo "--- Concern 2: GNN-only baselines ---"
 # B_VANILLA_T0: Pure GNN regression (no infeas head, no solver)
 if [[ -f "$CKPT_VANILLA" ]]; then
   run_eval "B_VANILLA_T0_baseline" "$CKPT_VANILLA" \
-    --adaptive-lm --T 5 --max-iter-inference 0 --lambda-infeasibility 0
+    --adaptive-lm --T 3 --max-iter-inference 0 --lambda-infeasibility 0
 fi
 
 # E_S1_T0:  Stage-1-only checkpoint, no solver (raw GNN quality)
 if [[ -f "$CKPT_E1_S1" ]]; then
   run_eval "E_S1_T0_gnn_direct" "$CKPT_E1_S1" \
-    --adaptive-lm --T 5 --max-iter-inference 0
+    --adaptive-lm --T 3 --max-iter-inference 0
 
   # E_S1_T5:  Stage-1-only checkpoint, T=5 solver at inference
   run_eval "E_S1_T5_plus_solver" "$CKPT_E1_S1" \
-    --adaptive-lm --T 5 --max-iter-inference 5
+    --adaptive-lm --T 3 --max-iter-inference 5
 
   # E_S1_T10: Stage-1-only checkpoint, T=10 solver
   run_eval "E_S1_T10_plus_solver" "$CKPT_E1_S1" \
-    --adaptive-lm --T 5 --max-iter-inference 10
+    --adaptive-lm --T 3 --max-iter-inference 10
 fi
 
 wait_all
@@ -241,21 +241,21 @@ echo "--- Goal 1: Accurate state estimation ---"
 
 # E2: Per-κ-bin breakdown (E1 checkpoint, default test set)
 run_eval "E2_per_bin_breakdown" "$CKPT_E1" \
-  --adaptive-lm --T 5
+  --adaptive-lm --T 3
 
 # E7_T0: GNN-only baseline — no solver iterations (warm-start quality)
 run_eval "E7_T0_gnn_only" "$CKPT_E1" \
-  --adaptive-lm --T 5 --max-iter-inference 0
+  --adaptive-lm --T 3 --max-iter-inference 0
 
 # E7_T1/T5/T10/T20: Iteration-vs-accuracy sweep (concern 8: wall-clock)
 run_eval "E7_T1_iters" "$CKPT_E1" \
-  --adaptive-lm --T 5 --max-iter-inference 1
+  --adaptive-lm --T 3 --max-iter-inference 1
 
 run_eval "E7_T5_iters" "$CKPT_E1" \
-  --adaptive-lm --T 5 --max-iter-inference 5
+  --adaptive-lm --T 3 --max-iter-inference 5
 
 run_eval "E7_T10_iters" "$CKPT_E1" \
-  --adaptive-lm --T 5 --max-iter-inference 10
+  --adaptive-lm --T 3 --max-iter-inference 10
 
 wait_all
 
@@ -264,15 +264,15 @@ echo "--- Concern 4: E1 per-contingency stratified ---"
 
 # E1_N0: E1 evaluated on N-only (base topology) test slice
 run_eval "E1_N0_base" "$CKPT_E1" \
-  --adaptive-lm --T 5 --test-contingency-filter 0
+  --adaptive-lm --T 3 --test-contingency-filter 0
 
 # E1_N1: E1 evaluated on N-1 test slice
 run_eval "E1_N1_contingency" "$CKPT_E1" \
-  --adaptive-lm --T 5 --test-contingency-filter 1
+  --adaptive-lm --T 3 --test-contingency-filter 1
 
 # E1_N2: E1 evaluated on N-2 test slice (concern 3: fills the gap)
 run_eval "E1_N2_contingency" "$CKPT_E1" \
-  --adaptive-lm --T 5 --test-contingency-filter 2
+  --adaptive-lm --T 3 --test-contingency-filter 2
 
 wait_all
 
@@ -281,11 +281,11 @@ echo "--- Goal 2: Infeasibility detection ---"
 
 # E6A: Infeasibility ablation — learned head only
 run_eval "E6A_infeas_learned_only" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode learned_only
+  --adaptive-lm --T 3 --infeas-detect-mode learned_only
 
 # E6B: Infeasibility ablation — heuristic only (mu-based)
 run_eval "E6B_infeas_heuristic_only" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only
+  --adaptive-lm --T 3 --infeas-detect-mode heuristic_only
 
 # E6C skipped — combined mode is the default, identical to E2
 
@@ -296,38 +296,38 @@ echo "--- Must-have 1: Per-contingency infeasibility calibration ---"
 
 # E6A learned-only, stratified by contingency order
 run_eval "E6A_learned_N0" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --adaptive-lm --T 3 --infeas-detect-mode learned_only \
   --test-contingency-filter 0
 
 run_eval "E6A_learned_N1" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --adaptive-lm --T 3 --infeas-detect-mode learned_only \
   --test-contingency-filter 1
 
 run_eval "E6A_learned_N2" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --adaptive-lm --T 3 --infeas-detect-mode learned_only \
   --test-contingency-filter 2
 
 run_eval "E6A_learned_N3" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode learned_only \
+  --adaptive-lm --T 3 --infeas-detect-mode learned_only \
   --test-data-dir "$N3_DIR" --test-contingency-filter 3
 
 wait_all
 
 # E6B heuristic-only, stratified by contingency order
 run_eval "E6B_heuristic_N0" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --adaptive-lm --T 3 --infeas-detect-mode heuristic_only \
   --test-contingency-filter 0
 
 run_eval "E6B_heuristic_N1" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --adaptive-lm --T 3 --infeas-detect-mode heuristic_only \
   --test-contingency-filter 1
 
 run_eval "E6B_heuristic_N2" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --adaptive-lm --T 3 --infeas-detect-mode heuristic_only \
   --test-contingency-filter 2
 
 run_eval "E6B_heuristic_N3" "$CKPT_E1" \
-  --adaptive-lm --T 5 --infeas-detect-mode heuristic_only \
+  --adaptive-lm --T 3 --infeas-detect-mode heuristic_only \
   --test-data-dir "$N3_DIR" --test-contingency-filter 3
 
 wait_all
@@ -338,26 +338,26 @@ echo "--- Goal 3: Topology transfer ---"
 # E3_eval: N+N-1 → N-2 transfer (adaptive LM, no dropout)
 if [[ -f "$CKPT_E3" ]]; then
   run_eval "E3_eval_n2_transfer" "$CKPT_E3" \
-    --adaptive-lm --T 5 \
+    --adaptive-lm --T 3 \
     --train-contingency-max 1 --test-contingency-filter 2
 fi
 
 # E5B_eval: N+N-1 → N-2 transfer (adaptive LM, with edge dropout)
 if [[ -f "$CKPT_E5B" ]]; then
   run_eval "E5B_eval_dropout_n2" "$CKPT_E5B" \
-    --adaptive-lm --T 5 \
+    --adaptive-lm --T 3 \
     --train-contingency-max 1 --test-contingency-filter 2
 fi
 
 # E4: N-{1,2} → N-3 transfer (E1, full-trained, N-3 test set)
 run_eval "E4_n3_transfer" "$CKPT_E1" \
-  --adaptive-lm --T 5 \
+  --adaptive-lm --T 3 \
   --test-data-dir "$N3_DIR" --test-contingency-filter 3
 
 # E3 → N-3 transfer (trained on N+N-1 only, no dropout)
 if [[ -f "$CKPT_E3" ]]; then
   run_eval "E3_eval_n3_transfer" "$CKPT_E3" \
-    --adaptive-lm --T 5 \
+    --adaptive-lm --T 3 \
     --train-contingency-max 1 \
     --test-data-dir "$N3_DIR" --test-contingency-filter 3
 fi
@@ -365,7 +365,7 @@ fi
 # E5B → N-3 transfer (trained on N+N-1, with edge dropout)
 if [[ -f "$CKPT_E5B" ]]; then
   run_eval "E5B_eval_n3_transfer" "$CKPT_E5B" \
-    --adaptive-lm --T 5 \
+    --adaptive-lm --T 3 \
     --train-contingency-max 1 --edge-dropout 0.05 \
     --test-data-dir "$N3_DIR" --test-contingency-filter 3
 fi
