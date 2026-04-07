@@ -151,6 +151,8 @@ def build_ybus(network_data: dict) -> np.ndarray:
         Y[t, t] += y_s + y_to
 
     for shunt in network_data.get("shunt", {}).values():
+        if shunt.get("status", 1) != 1:
+            continue
         i = int(shunt["shunt_bus"]) - 1
         Y[i, i] += complex(shunt["gs"], shunt["bs"])
 
@@ -273,13 +275,14 @@ def extract_bus_data(network_data: dict, solution_data: dict) -> BusData:
     """
     Aggregate per-bus quantities from PowerModels dicts.
     Loads and shunts are summed per bus. Inactive generators are skipped.
-    PV buses with zero active generation are reclassified as PQ.
+    PV buses with no active generators are reclassified as PQ.
     """
     n = len(network_data["bus"])
     types = np.zeros(n, dtype=int)
     pd, qd, pg, qg = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
     vm, va = np.zeros(n), np.zeros(n)
     gs, bs = np.zeros(n), np.zeros(n)
+    has_active_gen = np.zeros(n, dtype=bool)
 
     for bid_str, bus in network_data["bus"].items():
         i = int(bid_str) - 1
@@ -288,6 +291,8 @@ def extract_bus_data(network_data: dict, solution_data: dict) -> BusData:
         vm[i], va[i] = sol["vm"], sol["va"]
 
     for load in network_data["load"].values():
+        if load.get("status", 1) != 1:
+            continue
         i = int(load["load_bus"]) - 1
         pd[i] += load["pd"]
         qd[i] += load["qd"]
@@ -296,18 +301,21 @@ def extract_bus_data(network_data: dict, solution_data: dict) -> BusData:
         if gen["gen_status"] != 1:
             continue
         i = int(gen["gen_bus"]) - 1
+        has_active_gen[i] = True
         gen_sol = solution_data["gen"][gid]
         pg[i] += gen_sol["pg"]
         qg[i] += gen_sol["qg"]
 
     for sh in network_data.get("shunt", {}).values():
+        if sh.get("status", 1) != 1:
+            continue
         i = int(sh["shunt_bus"]) - 1
         gs[i] += sh["gs"]
         bs[i] += sh["bs"]
 
-    # PV bus with no active gen effectively becomes PQ
+    # PV bus with no active generators (all tripped) becomes PQ
     for i in range(n):
-        if types[i] == 2 and pg[i] == 0.0:
+        if types[i] == 2 and not has_active_gen[i]:
             types[i] = 1
 
     return BusData(types, pd, qd, pg, qg, vm, va, gs, bs)

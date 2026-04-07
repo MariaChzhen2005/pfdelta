@@ -432,7 +432,7 @@ def extract_per_graph_standalone(
         ea_g = {k: v[edge_mask] for k, v in edge_raw.items()}
 
         if bidirectional:
-            fwd = ei_g[0] < ei_g[1]
+            fwd = torch.arange(ei_g.shape[1], device=ei_g.device) % 2 == 0
             ei_phys = ei_g[:, fwd]
             ea_phys = {k: v[fwd] for k, v in ea_g.items()}
         else:
@@ -1364,7 +1364,7 @@ class BifurcationAwarePFSolver(nn.Module):
             ea_g = {k: v[edge_mask] for k, v in edge_raw.items()}
 
             if self.cfg.bidirectional_edges:
-                fwd = ei_g[0] < ei_g[1]
+                fwd = torch.arange(ei_g.shape[1], device=ei_g.device) % 2 == 0
                 ei_phys = ei_g[:, fwd]
                 ea_phys = {k: v[fwd] for k, v in ea_g.items()}
             else:
