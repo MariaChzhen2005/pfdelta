@@ -1,0 +1,27 @@
+23:07:37  INFO      ============================================================
+23:07:37  INFO      STAGE 1 — 200 epochs  (solver OFF)
+23:07:37  INFO      ============================================================
+Stage 1:   0%|                                                         | 0/200 [00:03<?, ?ep/s]
+Traceback (most recent call last):                                                             
+  File "/workspace/pfdelta/models.py", line 3233, in <module>
+    main()
+  File "/workspace/pfdelta/models.py", line 3221, in main
+    trainer.train(stages=args.stage)
+  File "/workspace/pfdelta/models.py", line 1803, in train
+    self._run_stage(1, self.cfg.epochs_stage1, 0)
+  File "/workspace/pfdelta/models.py", line 1705, in _run_stage
+    outputs = self.model(
+              ^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 1402, in forward
+    per_graph = self._extract_per_graph(data, node_raw)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/pfdelta/models.py", line 1369, in _extract_per_graph
+    ea_phys = {k: v[fwd] for k, v in ea_g.items()}
+               ^^^^^^^^^
+KeyboardInterrupt
