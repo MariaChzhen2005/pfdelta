@@ -80,5 +80,28 @@ Stage 2:  70%|███████   | 14/20 [3:25:03<1:21:52, 818.80s/ep, es=0
 Stage 2:  75%|███████▌  | 15/20 [3:38:39<1:08:10, 818.03s/ep, es=0/15, loss=0.0072, lr=5.0e-04, val=0.0037]05:25:50  INFO      Ep 96 (stage 2)  loss=0.00721  val=0.00366  t=759.8s  lr=5.00e-04  es=0/15
 Stage 2:  80%|████████  | 16/20 [3:52:17<54:29, 817.47s/ep, es=1/15, loss=0.0070, lr=5.0e-04, val=0.0041]05:39:29  INFO      Ep 97 (stage 2)  loss=0.00705  val=0.00406  t=762.6s  lr=5.00e-04  es=1/15
 Stage 2:  85%|████████▌ | 17/20 [4:05:52<40:53, 817.81s/ep, es=2/15, loss=0.0066, lr=5.0e-04, val=0.0038]05:53:04  INFO      Ep 98 (stage 2)  loss=0.00664  val=0.00378  t=758.7s  lr=5.00e-04  es=2/15
-Stage 2:  90%|█████████ | 18/20 [4:05:52<27:13, 816.89s/ep, es=2/15, loss=0.0066, lr=5.0e-04, val=0.0038]
-  Ep 99:  92%|█████████▏| 664/719 [11:42<00:57,  1.04s/batch, loss=0.0078]
+Stage 2:  90%|█████████ | 18/20 [4:19:32<27:13, 816.89s/ep, es=3/15, loss=0.0072, lr=2.5e-04, val=0.0040]06:06:43  INFO      Ep 99 (stage 2)  loss=0.00724  val=0.00405  t=763.3s  lr=2.50e-04  es=3/15
+Stage 2:  95%|█████████▌| 19/20 [4:33:09<13:37, 817.62s/ep, es=4/15, loss=0.0065, lr=2.5e-04, val=0.0038]06:20:21  INFO      Ep 100 (stage 2)  loss=0.00653  val=0.00377  t=761.8s  lr=2.50e-04  es=4/15
+06:20:21  INFO      Checkpoint → checkpoints/epoch_100_stage2_hd64_lr0.001_T5_d424dd.pt
+Stage 2: 100%|██████████| 20/20 [4:33:09<00:00, 819.50s/ep, es=4/15, loss=0.0065, lr=2.5e-04, val=0.0038]
+06:20:21  INFO      Restored best model (val_loss=0.003656)
+06:20:21  INFO      Training complete in 25828.7s
+06:20:21  INFO      Final model → checkpoints/final_model_hd64_lr0.001_T5_d424dd.pt
+06:20:21  INFO      Running test inference …
+Inference: 100%|██████████| 342/342 [03:26<00:00,  1.66batch/s, samples=43680]
+06:23:47  INFO      Out of 43680 grids, 21946 are actually feasible.
+06:23:47  INFO      Solver converged on 0 of them.  Feasible conv rate: 0.000
+06:23:48  INFO        Reject curves computed (signals: residual, mu)
+06:23:48  INFO        μ-trajectory: 0 converged, 43680 non-converged
+06:23:48  INFO      Inference: 43680 samples  149.90s (0.0034s/sample)  conv=0.000  state_mse=0.024767  infeas P/R/F1=0.995/1.000/0.998  detect=combined
+06:23:48  INFO        MaxVmErr mean=0.266861  p95=0.392166  worst=0.560000  avg_iters=20.0
+06:23:48  INFO        AUROC=1.0000  ECE=0.0000
+06:23:48  INFO        Spearman(μ,err)=0.0928
+06:23:48  INFO        Spearman(‖F‖,err)=0.3341
+06:23:48  INFO        Reject(residual)  mse@90%=0.025333  mse@100%=0.024767  gain=-2.3%
+06:23:48  INFO        Reject(mu)  mse@90%=0.024614  mse@100%=0.024767  gain=0.6%
+06:23:48  INFO        Reject(residual)  hard-detect AUROC=0.6493
+06:23:48  INFO        Reject(mu)  hard-detect AUROC=0.6321
+06:23:48  INFO        [easy] n=18717  conv=0.000  mse=0.024649  residual=0.023893  max_vm=0.265292
+06:23:48  INFO        [moderate] n=3229  conv=0.000  mse=0.025450  residual=0.053023  max_vm=0.275956
+06:23:48  INFO        [infeasible] n=21734  conv=0.000  mse=N/A  residual=0.427044  max_vm=N/A

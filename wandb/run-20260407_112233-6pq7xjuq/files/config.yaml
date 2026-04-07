@@ -1,0 +1,221 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            un33j6jccxvbrh1taj54kvm8dugy43af:
+                args:
+                    - --data-dir
+                    - data/processed/task4_solvability
+                    - --checkpoint-dir
+                    - checkpoints
+                    - --log-dir
+                    - logs
+                    - --wandb-project
+                    - pfdelta-bifurcation
+                    - --hidden-dim
+                    - "64"
+                    - --num-mp-layers
+                    - "4"
+                    - --lr
+                    - "1e-3"
+                    - --batch-size
+                    - "128"
+                    - --epochs-stage1
+                    - "80"
+                    - --epochs-stage2
+                    - "20"
+                    - --early-stop-patience
+                    - "15"
+                    - --seed
+                    - "42"
+                    - --amp
+                    - --adaptive-lm
+                    - --T
+                    - "5"
+                    - --test-data-dir
+                    - data/processed/task4_solvability_n3
+                    - --test-contingency-filter
+                    - "3"
+                    - --eval-only
+                    - checkpoints/final_model_hd64_lr0.001_T5_51418c.pt
+                    - --wandb-run-name
+                    - E4_n3_transfer
+                codePath: models.py
+                codePathLocal: models.py
+                cpu_count: 48
+                cpu_count_logical: 96
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "34359738368"
+                        used: "32629686272"
+                email: mzcan2017china@gmail.com
+                executable: /venv/main/bin/python
+                git:
+                    commit: 8cada93963aee974997816dd1fa2ddbf45ee1695
+                    remote: https://github.com/MariaChzhen2005/pfdelta.git
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-51efc453-c4b8-a271-463c-d835821750f9
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-6f650880-4657-c42f-a0da-23854be93175
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-69da33a3-fa33-30ea-a4a1-608c809b2cbf
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-fcae7fd2-e659-1bb5-beee-5a6321c49e6d
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-6ad0f7f7-57b1-0424-f5d2-82d7bd3897b7
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-329cae12-3f3c-becc-dc1d-df6315645325
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-a752878d-fd65-2ed8-1c4c-c9abafea6478
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-da8153bd-5d54-a408-729c-dd4bea0766ea
+                host: af63baca685b
+                memory:
+                    total: "540621570048"
+                os: Linux-6.5.0-1018-oem-x86_64-with-glibc2.39
+                program: /workspace/pfdelta/models.py
+                python: CPython 3.12.13
+                root: /workspace/pfdelta
+                startedAt: "2026-04-07T11:22:33.269899Z"
+                writerId: un33j6jccxvbrh1taj54kvm8dugy43af
+        m: []
+        python_version: 3.12.13
+        t:
+            "1":
+                - 1
+                - 77
+            "2":
+                - 1
+                - 77
+            "3":
+                - 2
+                - 13
+                - 16
+            "4": 3.12.13
+            "5": 0.25.1
+            "10":
+                - 20
+            "12": 0.25.1
+            "13": linux-x86_64
+T:
+    value: 5
+batch_size:
+    value: 128
+bidirectional_edges:
+    value: true
+checkpoint_dir:
+    value: checkpoints
+data_dir:
+    value: data/processed/task4_solvability
+dropout:
+    value: 0.1
+early_stop_patience:
+    value: 15
+edge_dropout_p:
+    value: 0
+epochs_stage1:
+    value: 80
+epochs_stage2:
+    value: 20
+epsilon:
+    value: 1e-07
+grad_clip:
+    value: 1
+hidden_dim:
+    value: 64
+infeas_detect_mode:
+    value: combined
+lambda_1:
+    value: 1
+lambda_2:
+    value: 1
+lambda_3:
+    value: 0.001
+lambda_infeasibility:
+    value: 1
+log_dir:
+    value: logs
+lr:
+    value: 0.001
+max_iter_inference:
+    value: 20
+mu_decrease:
+    value: 0.5
+mu_increase:
+    value: 2
+mu_init:
+    value: 0.001
+mu_max:
+    value: 1e+06
+mu_min:
+    value: 1e-08
+num_attention_heads:
+    value: 4
+num_mp_layers:
+    value: 4
+num_workers:
+    value: 0
+pin_memory:
+    value: true
+rank_k:
+    value: 8
+scheduler_factor:
+    value: 0.5
+scheduler_patience:
+    value: 10
+seed:
+    value: 42
+stagnation_tol:
+    value: 1e-06
+tau:
+    value: 50
+test_contingency_filter:
+    value: 3
+test_data_dir:
+    value: data/processed/task4_solvability_n3
+train_contingency_max:
+    value: -1
+use_adaptive_lm:
+    value: true
+use_amp:
+    value: true
+use_global_attention:
+    value: true
+vm_max:
+    value: 1.5
+vm_min:
+    value: 0.5
+wandb_project:
+    value: pfdelta-bifurcation
+wandb_run_name:
+    value: E4_n3_transfer
+weight_decay:
+    value: 1e-05

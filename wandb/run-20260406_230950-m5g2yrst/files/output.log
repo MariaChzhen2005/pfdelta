@@ -109,5 +109,34 @@ Stage 2:  45%|████▌     | 9/20 [2:15:08<2:28:32, 810.27s/ep, es=5/15, 
 Stage 2:  50%|█████     | 10/20 [2:28:36<2:14:55, 809.53s/ep, es=6/15, loss=0.0060, lr=2.5e-04, val=0.0054]05:35:52  INFO      Ep 91 (stage 2)  loss=0.00597  val=0.00535  t=749.3s  lr=2.50e-04  es=6/15
 Stage 2:  55%|█████▌    | 11/20 [2:42:07<2:01:22, 809.17s/ep, es=7/15, loss=0.0046, lr=2.5e-04, val=0.0041]05:49:23  INFO      Ep 92 (stage 2)  loss=0.00462  val=0.00406  t=752.0s  lr=2.50e-04  es=7/15
 Stage 2:  60%|██████    | 12/20 [2:55:36<1:47:58, 809.77s/ep, es=8/15, loss=0.0050, lr=2.5e-04, val=0.0051]06:02:52  INFO      Ep 93 (stage 2)  loss=0.00497  val=0.00506  t=749.3s  lr=2.50e-04  es=8/15
-Stage 2:  65%|██████▌   | 13/20 [2:55:36<1:34:25, 809.37s/ep, es=8/15, loss=0.0050, lr=2.5e-04, val=0.0051]
-  Ep 94:  15%|█▌        | 109/719 [01:53<10:29,  1.03s/batch, loss=0.0043]
+Stage 2:  65%|██████▌   | 13/20 [3:09:06<1:34:25, 809.37s/ep, es=9/15, loss=0.0046, lr=2.5e-04, val=0.0043]06:16:22  INFO      Ep 94 (stage 2)  loss=0.00464  val=0.00430  t=750.6s  lr=2.50e-04  es=9/15
+Stage 2:  70%|███████   | 14/20 [3:23:00<1:20:57, 809.53s/ep, es=10/15, loss=0.0043, lr=2.5e-04, val=0.0053]06:30:16  INFO      Ep 95 (stage 2)  loss=0.00429  val=0.00534  t=777.5s  lr=2.50e-04  es=10/15
+Stage 2:  75%|███████▌  | 15/20 [3:36:31<1:08:04, 816.94s/ep, es=11/15, loss=0.0049, lr=2.5e-04, val=0.0042]06:43:47  INFO      Ep 96 (stage 2)  loss=0.00487  val=0.00423  t=755.3s  lr=2.50e-04  es=11/15
+Stage 2:  80%|████████  | 16/20 [3:50:04<54:21, 815.29s/ep, es=12/15, loss=0.0046, lr=2.5e-04, val=0.0040]06:57:20  INFO      Ep 97 (stage 2)  loss=0.00462  val=0.00397  t=756.5s  lr=2.50e-04  es=12/15
+Stage 2:  85%|████████▌ | 17/20 [4:03:39<40:43, 814.64s/ep, es=13/15, loss=0.0047, lr=2.5e-04, val=0.0043]07:10:56  INFO      Ep 98 (stage 2)  loss=0.00472  val=0.00431  t=758.7s  lr=2.50e-04  es=13/15
+Stage 2:  90%|█████████ | 18/20 [4:17:09<27:09, 814.80s/ep, es=14/15, loss=0.0045, lr=1.3e-04, val=0.0037]07:24:25  INFO      Ep 99 (stage 2)  loss=0.00450  val=0.00369  t=753.3s  lr=1.25e-04  es=14/15
+Stage 2:  95%|█████████▌| 19/20 [4:30:41<13:33, 813.19s/ep, es=15/15, loss=0.0042, lr=1.3e-04, val=0.0035]07:37:57  INFO      Ep 100 (stage 2)  loss=0.00423  val=0.00348  t=755.6s  lr=1.25e-04  es=15/15
+07:37:57  INFO      Checkpoint → checkpoints/epoch_100_stage2_hd64_lr0.001_T5_bfd2c4.pt
+07:37:57  INFO      Early stopping triggered at epoch 100
+Stage 2:  95%|█████████▌| 19/20 [4:30:41<14:14, 854.81s/ep, es=15/15, loss=0.0042, lr=1.3e-04, val=0.0035]
+07:37:57  INFO      Restored best model (val_loss=0.003206)
+07:37:57  INFO      Training complete in 30485.8s
+07:37:57  INFO      Final model → checkpoints/final_model_hd64_lr0.001_T5_bfd2c4.pt
+07:37:57  INFO      Running test inference …
+Inference: 100%|██████████| 342/342 [03:11<00:00,  1.78batch/s, samples=43680]
+07:41:09  INFO      Out of 43680 grids, 21946 are actually feasible.
+07:41:09  INFO      Solver converged on 0 of them.  Feasible conv rate: 0.000
+07:41:09  INFO        Reject curves computed (signals: residual, mu)
+07:41:10  INFO        μ-trajectory: 0 converged, 43680 non-converged
+07:41:10  INFO      Inference: 43680 samples  139.08s (0.0032s/sample)  conv=0.000  state_mse=0.024894  infeas P/R/F1=0.994/1.000/0.997  detect=combined
+07:41:10  INFO        MaxVmErr mean=0.267425  p95=0.392783  worst=0.547894  avg_iters=20.0
+07:41:10  INFO        AUROC=1.0000  ECE=0.0003
+07:41:10  INFO        Spearman(μ,err)=0.0646
+07:41:10  INFO        Spearman(‖F‖,err)=0.3397
+07:41:10  INFO        Reject(residual)  mse@90%=0.025418  mse@100%=0.024894  gain=-2.1%
+07:41:10  INFO        Reject(mu)  mse@90%=0.024708  mse@100%=0.024894  gain=0.7%
+07:41:10  INFO        Reject(residual)  hard-detect AUROC=0.6561
+07:41:10  INFO        Reject(mu)  hard-detect AUROC=0.6243
+07:41:10  INFO        [easy] n=18717  conv=0.000  mse=0.024799  residual=0.024076  max_vm=0.265799
+07:41:10  INFO        [moderate] n=3229  conv=0.000  mse=0.025443  residual=0.053732  max_vm=0.276848
+07:41:10  INFO        [infeasible] n=21734  conv=0.000  mse=N/A  residual=0.422591  max_vm=N/A
