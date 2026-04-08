@@ -1,0 +1,6 @@
+FlatStart: 100%|██████████| 171/171 [02:00<00:00,  1.42batch/s, samples=43680]
+03:20:22  INFO      FlatStart: 43680 samples  15.52s (0.0004s/sample)  conv=0.502  feas_conv=0.999  state_mse=0.000010  avg_iters=5.0
+03:20:22  INFO        MaxVmErr mean=0.000032  p95=0.000002  worst=0.057062
+03:20:22  INFO        [easy] n=21640  conv=0.999  mse=0.000010  residual=0.000099
+03:20:22  INFO        [moderate] n=306  conv=0.993  mse=0.000005  residual=0.000094
+03:20:22  INFO        [infeasible] n=21734  conv=0.000  mse=N/A  residual=0.671019
