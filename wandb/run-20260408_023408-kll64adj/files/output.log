@@ -1,1 +1,16 @@
-Inference:  62%|██████▏   | 106/171 [01:04<00:39,  1.65batch/s, samples=27136]
+Inference: 100%|██████████| 171/171 [01:43<00:00,  1.65batch/s, samples=43680]
+02:35:53  INFO      Out of 43680 grids, 21946 are actually feasible.
+02:35:53  INFO      Solver converged on 0 of them.  Feasible conv rate: 0.000
+02:35:54  INFO        Reject curves computed (signals: residual, mu)
+02:35:54  INFO      Inference: 43680 samples  51.70s (0.0012s/sample)  conv=0.000  state_mse=0.000124  infeas P/R/F1=0.498/1.000/0.665  detect=combined
+02:35:54  INFO        MaxVmErr mean=0.015878  p95=0.033076  worst=0.242506  avg_iters=0.0
+02:35:54  INFO        AUROC=1.0000  ECE=0.0024
+02:35:54  INFO        Spearman(μ,err)=0.0063
+02:35:54  INFO        Spearman(‖F‖,err)=0.4231
+02:35:54  INFO        Reject(residual)  mse@90%=0.000087  mse@100%=0.000124  gain=30.0%
+02:35:54  INFO        Reject(mu)  mse@90%=0.000124  mse@100%=0.000124  gain=0.3%
+02:35:54  INFO        Reject(residual)  hard-detect AUROC=0.6895
+02:35:54  INFO        Reject(mu)  hard-detect AUROC=1.0000
+02:35:54  INFO        [easy] n=21640  conv=0.000  mse=0.000111  residual=0.383564  max_vm=0.015395
+02:35:54  INFO        [moderate] n=306  conv=0.000  mse=0.001029  residual=0.917652  max_vm=0.050042
+02:35:54  INFO        [infeasible] n=21734  conv=0.000  mse=N/A  residual=2.176703  max_vm=N/A
