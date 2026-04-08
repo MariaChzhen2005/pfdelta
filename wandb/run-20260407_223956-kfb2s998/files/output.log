@@ -1,0 +1,69 @@
+22:39:57  INFO      ============================================================
+22:39:57  INFO      STAGE 1 — 25 epochs  (solver OFF)
+22:39:57  INFO      ============================================================
+Stage 1:   0%|          | 0/25 [02:54<?, ?ep/s, es=0/8, loss=0.0440, lr=1.0e-03, val=0.0102]22:42:51  INFO      Ep 1 (stage 1)  loss=0.04401  val=0.01019  t=136.2s  lr=1.00e-03  es=0/8
+Stage 1:   4%|▍         | 1/25 [05:48<1:09:43, 174.32s/ep, es=0/8, loss=0.0066, lr=1.0e-03, val=0.0015]22:45:45  INFO      Ep 2 (stage 1)  loss=0.00658  val=0.00149  t=136.0s  lr=1.00e-03  es=0/8
+Stage 1:   8%|▊         | 2/25 [08:42<1:06:49, 174.32s/ep, es=1/8, loss=0.0038, lr=1.0e-03, val=0.0019]22:48:39  INFO      Ep 3 (stage 1)  loss=0.00379  val=0.00191  t=135.4s  lr=1.00e-03  es=1/8
+Stage 1:  12%|█▏        | 3/25 [11:39<1:03:49, 174.06s/ep, es=0/8, loss=0.0043, lr=1.0e-03, val=0.0009]22:51:36  INFO      Ep 4 (stage 1)  loss=0.00430  val=0.00093  t=135.8s  lr=1.00e-03  es=0/8
+Stage 1:  16%|█▌        | 4/25 [14:32<1:01:18, 175.17s/ep, es=1/8, loss=0.0038, lr=1.0e-03, val=0.0015]22:54:30  INFO      Ep 5 (stage 1)  loss=0.00379  val=0.00145  t=132.8s  lr=1.00e-03  es=1/8
+Stage 1:  20%|██        | 5/25 [17:26<58:11, 174.56s/ep, es=2/8, loss=0.0029, lr=1.0e-03, val=0.0452]22:57:24  INFO      Ep 6 (stage 1)  loss=0.00291  val=0.04520  t=135.8s  lr=1.00e-03  es=2/8
+Stage 1:  24%|██▍       | 6/25 [20:20<55:12, 174.36s/ep, es=0/8, loss=0.0019, lr=1.0e-03, val=0.0007]23:00:17  INFO      Ep 7 (stage 1)  loss=0.00195  val=0.00071  t=135.6s  lr=1.00e-03  es=0/8
+Stage 1:  28%|██▊       | 7/25 [23:14<52:14, 174.16s/ep, es=1/8, loss=0.0017, lr=1.0e-03, val=0.0008]23:03:11  INFO      Ep 8 (stage 1)  loss=0.00172  val=0.00077  t=135.6s  lr=1.00e-03  es=1/8
+Stage 1:  32%|███▏      | 8/25 [26:08<49:18, 174.01s/ep, es=2/8, loss=0.0018, lr=1.0e-03, val=0.0009]23:06:05  INFO      Ep 9 (stage 1)  loss=0.00176  val=0.00090  t=136.0s  lr=1.00e-03  es=2/8
+Stage 1:  36%|███▌      | 9/25 [29:00<46:23, 174.00s/ep, es=3/8, loss=0.0013, lr=1.0e-03, val=0.0024]23:08:58  INFO      Ep 10 (stage 1)  loss=0.00126  val=0.00236  t=134.7s  lr=1.00e-03  es=3/8
+23:08:58  INFO      Checkpoint → checkpoints/epoch_10_stage1_hd64_lr0.001_T3_fe74ca.pt
+Stage 1:  40%|████      | 10/25 [31:53<43:24, 173.61s/ep, es=4/8, loss=0.0020, lr=1.0e-03, val=0.0007]23:11:50  INFO      Ep 11 (stage 1)  loss=0.00198  val=0.00072  t=134.2s  lr=1.00e-03  es=4/8
+Stage 1:  44%|████▍     | 11/25 [34:50<40:25, 173.22s/ep, es=0/8, loss=0.0018, lr=1.0e-03, val=0.0005]23:14:47  INFO      Ep 12 (stage 1)  loss=0.00184  val=0.00055  t=135.7s  lr=1.00e-03  es=0/8
+Stage 1:  48%|████▊     | 12/25 [37:43<37:46, 174.37s/ep, es=1/8, loss=0.0007, lr=1.0e-03, val=0.0008]23:17:41  INFO      Ep 13 (stage 1)  loss=0.00066  val=0.00085  t=135.5s  lr=1.00e-03  es=1/8
+Stage 1:  52%|█████▏    | 13/25 [40:38<34:49, 174.15s/ep, es=0/8, loss=0.0005, lr=1.0e-03, val=0.0003]23:20:35  INFO      Ep 14 (stage 1)  loss=0.00054  val=0.00035  t=136.3s  lr=1.00e-03  es=0/8
+Stage 1:  56%|█████▌    | 14/25 [43:31<31:56, 174.22s/ep, es=1/8, loss=0.0005, lr=1.0e-03, val=0.0004]23:23:28  INFO      Ep 15 (stage 1)  loss=0.00046  val=0.00036  t=135.1s  lr=1.00e-03  es=1/8
+Stage 1:  60%|██████    | 15/25 [46:27<28:59, 173.95s/ep, es=2/8, loss=0.0098, lr=1.0e-03, val=0.0018]23:26:24  INFO      Ep 16 (stage 1)  loss=0.00981  val=0.00181  t=135.0s  lr=1.00e-03  es=2/8
+Stage 1:  64%|██████▍   | 16/25 [49:21<26:10, 174.55s/ep, es=3/8, loss=0.0016, lr=1.0e-03, val=0.0005]23:29:18  INFO      Ep 17 (stage 1)  loss=0.00159  val=0.00046  t=133.0s  lr=1.00e-03  es=3/8
+Stage 1:  68%|██████▊   | 17/25 [52:15<23:15, 174.40s/ep, es=4/8, loss=0.0014, lr=1.0e-03, val=0.0005]23:32:12  INFO      Ep 18 (stage 1)  loss=0.00142  val=0.00047  t=135.5s  lr=1.00e-03  es=4/8
+Stage 1:  72%|███████▏  | 18/25 [55:09<20:19, 174.16s/ep, es=5/8, loss=0.0006, lr=1.0e-03, val=0.0004]23:35:06  INFO      Ep 19 (stage 1)  loss=0.00055  val=0.00038  t=135.7s  lr=1.00e-03  es=5/8
+Stage 1:  76%|███████▌  | 19/25 [58:05<17:24, 174.07s/ep, es=0/8, loss=0.0005, lr=1.0e-03, val=0.0003]23:38:03  INFO      Ep 20 (stage 1)  loss=0.00047  val=0.00034  t=135.6s  lr=1.00e-03  es=0/8
+23:38:03  INFO      Checkpoint → checkpoints/epoch_20_stage1_hd64_lr0.001_T3_fe74ca.pt
+Stage 1:  80%|████████  | 20/25 [1:00:59<14:34, 174.89s/ep, es=0/8, loss=0.0004, lr=1.0e-03, val=0.0003]23:40:56  INFO      Ep 21 (stage 1)  loss=0.00043  val=0.00031  t=132.4s  lr=1.00e-03  es=0/8
+Stage 1:  84%|████████▍ | 21/25 [1:03:52<11:37, 174.43s/ep, es=1/8, loss=0.0026, lr=1.0e-03, val=0.0004]23:43:50  INFO      Ep 22 (stage 1)  loss=0.00260  val=0.00040  t=132.7s  lr=1.00e-03  es=1/8
+Stage 1:  88%|████████▊ | 22/25 [1:06:46<08:42, 174.23s/ep, es=2/8, loss=0.0005, lr=1.0e-03, val=0.0003]23:46:43  INFO      Ep 23 (stage 1)  loss=0.00047  val=0.00031  t=132.4s  lr=1.00e-03  es=2/8
+Stage 1:  92%|█████████▏| 23/25 [1:09:39<05:47, 173.92s/ep, es=0/8, loss=0.0004, lr=1.0e-03, val=0.0003]23:49:37  INFO      Ep 24 (stage 1)  loss=0.00041  val=0.00030  t=135.6s  lr=1.00e-03  es=0/8
+Stage 1:  96%|█████████▌| 24/25 [1:12:33<02:53, 173.86s/ep, es=0/8, loss=0.0004, lr=1.0e-03, val=0.0002]23:52:30  INFO      Ep 25 (stage 1)  loss=0.00037  val=0.00024  t=135.5s  lr=1.00e-03  es=0/8
+Stage 1: 100%|██████████| 25/25 [1:12:33<00:00, 174.14s/ep, es=0/8, loss=0.0004, lr=1.0e-03, val=0.0002]
+23:52:30  INFO      Restored best model (val_loss=0.000245)
+23:52:30  INFO      Checkpoint → checkpoints/epoch_25_stage1_final_hd64_lr0.001_T3_fe74ca.pt
+23:52:30  INFO      ============================================================
+23:52:30  INFO      STAGE 2 — 10 epochs  (solver ON)
+23:52:30  INFO      ============================================================
+Stage 2:   0%|          | 0/10 [09:13<?, ?ep/s, es=0/8, loss=0.0070, lr=1.0e-03, val=0.0011]00:01:44  INFO      Ep 26 (stage 2)  loss=0.00701  val=0.00106  t=506.8s  lr=1.00e-03  es=0/8
+Stage 2:  10%|█         | 1/10 [18:25<1:23:01, 553.51s/ep, es=1/8, loss=0.0016, lr=1.0e-03, val=0.0015]00:10:56  INFO      Ep 27 (stage 2)  loss=0.00156  val=0.00149  t=502.5s  lr=1.00e-03  es=1/8
+Stage 2:  20%|██        | 2/10 [27:33<1:13:40, 552.59s/ep, es=2/8, loss=0.0024, lr=1.0e-03, val=0.0011]00:20:03  INFO      Ep 28 (stage 2)  loss=0.00239  val=0.00107  t=501.7s  lr=1.00e-03  es=2/8
+Stage 2:  30%|███       | 3/10 [36:42<1:04:12, 550.34s/ep, es=3/8, loss=0.0030, lr=1.0e-03, val=0.0023]00:29:13  INFO      Ep 29 (stage 2)  loss=0.00297  val=0.00229  t=503.1s  lr=1.00e-03  es=3/8
+Stage 2:  40%|████      | 4/10 [45:54<54:59, 549.88s/ep, es=0/8, loss=0.0013, lr=1.0e-03, val=0.0007]00:38:24  INFO      Ep 30 (stage 2)  loss=0.00126  val=0.00068  t=502.6s  lr=1.00e-03  es=0/8
+00:38:24  INFO      Checkpoint → checkpoints/epoch_30_stage2_hd64_lr0.001_T3_fe74ca.pt
+Stage 2:  50%|█████     | 5/10 [55:01<45:52, 550.56s/ep, es=0/8, loss=0.0011, lr=5.0e-04, val=0.0006]00:47:32  INFO      Ep 31 (stage 2)  loss=0.00105  val=0.00056  t=501.6s  lr=5.00e-04  es=0/8
+Stage 2:  60%|██████    | 6/10 [1:04:11<36:38, 549.59s/ep, es=0/8, loss=0.0009, lr=5.0e-04, val=0.0005]00:56:41  INFO      Ep 32 (stage 2)  loss=0.00087  val=0.00054  t=503.4s  lr=5.00e-04  es=0/8
+Stage 2:  70%|███████   | 7/10 [1:13:22<27:28, 549.56s/ep, es=0/8, loss=0.0008, lr=5.0e-04, val=0.0005]01:05:53  INFO      Ep 33 (stage 2)  loss=0.00081  val=0.00050  t=502.2s  lr=5.00e-04  es=0/8
+Stage 2:  80%|████████  | 8/10 [1:22:30<18:20, 550.13s/ep, es=0/8, loss=0.0007, lr=5.0e-04, val=0.0004]01:15:01  INFO      Ep 34 (stage 2)  loss=0.00072  val=0.00043  t=502.0s  lr=5.00e-04  es=0/8
+Stage 2:  90%|█████████ | 9/10 [1:31:41<09:09, 549.46s/ep, es=1/8, loss=0.0016, lr=5.0e-04, val=0.0019]01:24:11  INFO      Ep 35 (stage 2)  loss=0.00158  val=0.00191  t=504.8s  lr=5.00e-04  es=1/8
+Stage 2: 100%|██████████| 10/10 [1:31:41<00:00, 550.12s/ep, es=1/8, loss=0.0016, lr=5.0e-04, val=0.0019]
+01:24:11  INFO      Restored best model (val_loss=0.000429)
+01:24:11  INFO      Training complete in 9854.7s
+01:24:11  INFO      Final model → checkpoints/final_model_hd64_lr0.001_T3_fe74ca.pt
+01:24:11  INFO      Running test inference …
+Inference: 100%|██████████| 171/171 [02:40<00:00,  1.07batch/s, samples=43680]
+01:26:52  INFO      Out of 43680 grids, 21946 are actually feasible.
+01:26:52  INFO      Solver converged on 0 of them.  Feasible conv rate: 0.000
+01:26:52  INFO        Reject curves computed (signals: residual, mu)
+01:26:53  INFO        μ-trajectory: 0 converged, 43680 non-converged
+01:26:53  INFO      Inference: 43680 samples  107.77s (0.0025s/sample)  conv=0.000  state_mse=0.000000  infeas P/R/F1=1.000/1.000/1.000  detect=combined
+01:26:53  INFO        MaxVmErr mean=0.000001  p95=0.000001  worst=0.000387  avg_iters=20.0
+01:26:53  INFO        AUROC=1.0000  ECE=0.0001
+01:26:53  INFO        Spearman(μ,err)=-0.0450
+01:26:53  INFO        Spearman(‖F‖,err)=0.5173
+01:26:53  INFO        Reject(residual)  mse@90%=0.000000  mse@100%=0.000000  gain=-6.2%
+01:26:53  INFO        Reject(mu)  mse@90%=0.000000  mse@100%=0.000000  gain=-8.1%
+01:26:53  INFO        Reject(residual)  hard-detect AUROC=0.7702
+01:26:53  INFO        Reject(mu)  hard-detect AUROC=0.5766
+01:26:53  INFO        [easy] n=21640  conv=0.000  mse=0.000000  residual=0.000002  max_vm=0.000000
+01:26:53  INFO        [moderate] n=306  conv=0.000  mse=0.000000  residual=0.000003  max_vm=0.000006
+01:26:53  INFO        [infeasible] n=21734  conv=0.000  mse=N/A  residual=0.169301  max_vm=N/A
